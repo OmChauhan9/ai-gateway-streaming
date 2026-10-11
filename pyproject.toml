@@ -1,0 +1,34 @@
+[project]
+name = "ai-gateway"
+version = "0.1.0"
+description = "Production-grade Async AI Gateway with Streaming Telemetry, Circuit Breaking, and OTel GenAI Instrumentation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "opentelemetry-api>=1.26.0",
+    "opentelemetry-sdk>=1.26.0",
+    "opentelemetry-semantic-conventions>=0.47b0",
+    "prometheus-client>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "locust>=2.31.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = "test_*.py"
