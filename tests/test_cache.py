@@ -48,3 +48,35 @@ async def test_streaming_cache_hit(client):
     body2 = resp2.text
     assert "data: " in body2
     assert "[DONE]" in body2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variant",
+    [
+        {"max_tokens": 2},
+        {"stop": [" is"]},
+        {"n": 2},
+        {"presence_penalty": 1.0},
+        {"frequency_penalty": 1.0},
+        {"messages": [{"role": "user", "content": "Generation params cache prompt", "name": "alice"}]},
+    ],
+    ids=["max_tokens", "stop", "n", "presence_penalty", "frequency_penalty", "message_name"],
+)
+async def test_cache_key_distinguishes_generation_params(client, variant):
+    base = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Generation params cache prompt"}],
+        "temperature": 0.0,
+        "stream": False,
+    }
+
+    resp1 = await client.post("/v1/chat/completions", json={**base, **variant})
+    assert resp1.status_code == 200
+
+    resp2 = await client.post("/v1/chat/completions", json=base)
+    assert resp2.status_code == 200
+    assert resp2.headers.get("X-Cache") != "HIT", f"request differing in {variant} must not replay the cached response"
+
+    resp3 = await client.post("/v1/chat/completions", json=base)
+    assert resp3.headers.get("X-Cache") == "HIT", "an identical request still hits the cache"
