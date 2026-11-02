@@ -1,8 +1,30 @@
 """Integration tests for handling upstream mid-stream disconnection edge cases."""
 
 import time
+import httpx
 import pytest
 from gateway.stream.interceptor import telemetry_stream_interceptor
+
+
+@pytest.mark.asyncio
+async def test_midstream_drop_through_gateway_yields_error_frame_from_primary(client, gateway_app):
+    primary = httpx.ASGITransport(app=gateway_app.state.primary_mock_app)
+    async with httpx.AsyncClient(transport=primary, base_url="http://primary") as admin:
+        await admin.post("/admin/fault-injection", json={"fail_midstream": True})
+
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Mid-stream drop through the gateway"}],
+        "stream": True,
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 200
+    assert resp.headers["X-Gateway-Provider"] == "mock-groq-primary", "headers were already sent by the primary"
+    assert resp.headers["X-Gateway-Fallback"] == "false", "a drop after headers cannot fail over"
+    assert "Hello" in resp.text, "tokens sent before the drop reach the client"
+    assert "event: error" in resp.text, "the drop surfaces as an SSE error frame"
+    assert "upstream_connection_broken" in resp.text
 
 
 @pytest.mark.asyncio
