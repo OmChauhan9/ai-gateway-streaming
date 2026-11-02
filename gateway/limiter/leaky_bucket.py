@@ -30,6 +30,18 @@ class RateLimitExceeded(Exception):
         )
 
 
+class RequestExceedsCapacity(Exception):
+    """Raised when a single request needs more tokens than the bucket can ever hold."""
+    def __init__(self, key: str, requested: int, capacity: int):
+        self.key = key
+        self.requested = requested
+        self.capacity = capacity
+        super().__init__(
+            f"Request for key '{key}' needs {requested} tokens, "
+            f"more than the bucket capacity of {capacity}."
+        )
+
+
 @dataclass
 class BucketState:
     """State tracking for a single rate limiter key."""
@@ -72,8 +84,11 @@ class TokenLeakyBucketLimiter:
             Tuple[bool, float]: (admitted, retry_after_seconds)
             
         Raises:
+            RequestExceedsCapacity if tokens exceed capacity, so waiting can never help.
             RateLimitExceeded if admitted is False.
         """
+        if tokens > self.capacity:
+            raise RequestExceedsCapacity(key=key, requested=tokens, capacity=int(self.capacity))
         now = time.monotonic()
         async with self._lock:
             # Periodic cleanup of empty buckets to prevent memory leak

@@ -26,7 +26,7 @@ from gateway.circuit_breaker.provider_registry import (
     ProviderRegistry,
 )
 from gateway.circuit_breaker.state_machine import CircuitState
-from gateway.limiter.leaky_bucket import RateLimitExceeded, TokenLeakyBucketLimiter
+from gateway.limiter.leaky_bucket import RateLimitExceeded, RequestExceedsCapacity, TokenLeakyBucketLimiter
 from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
 from gateway.schemas.gateway_models import HealthResponse, StreamTelemetryData
 from gateway.schemas.openai import (
@@ -151,6 +151,19 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if ctx.settings.rate_limiter_enabled:
             try:
                 await ctx.limiter.acquire(client_key, prompt_tokens)
+            except RequestExceedsCapacity as rec:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"Request needs an estimated {rec.requested} tokens, more than the "
+                                f"token capacity of {rec.capacity}. Retrying will not help; shorten the prompt."
+                            ),
+                            "type": "request_exceeds_token_capacity",
+                        }
+                    },
+                )
             except RateLimitExceeded as rle:
                 ctx.metrics.record_rate_limit(client_key)
                 headers = {"Retry-After": str(int(rle.retry_after) + 1)}
