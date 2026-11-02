@@ -6,29 +6,25 @@ import time
 import pytest
 from gateway.schemas.gateway_models import StreamTelemetryData
 from gateway.stream.interceptor import telemetry_stream_interceptor
-from gateway.stream.sse_parser import extract_content_from_sse_chunk
+from gateway.stream.sse_parser import iter_sse_events
 
 
-def test_extract_content_from_sse_chunk():
-    # Role announcement (no content)
-    chunk1 = b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n'
-    assert extract_content_from_sse_chunk(chunk1) is None
+@pytest.mark.parametrize(
+    "event, expected",
+    [
+        (b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n', None),
+        (b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n', "Hello"),
+        (b'data: {"choices": [{"delta": {"content": " world!"}}]}\n\n', " world!"),
+        (b'data: {"choices": [{"delta": {"content": "He said \\"hi\\""}}]}\n\n', 'He said "hi"'),
+        (b"data: [DONE]\n\n", None),
+    ],
+    ids=["role", "token", "leading-space", "escaped-quotes", "done"],
+)
+async def test_iter_sse_events_extracts_delta_content(event, expected):
+    async def upstream():
+        yield event
 
-    # Normal token
-    chunk2 = b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n'
-    assert extract_content_from_sse_chunk(chunk2) == "Hello"
-
-    # Token with whitespace
-    chunk3 = b'data: {"choices": [{"delta": {"content": " world!"}}]}\n\n'
-    assert extract_content_from_sse_chunk(chunk3) == " world!"
-
-    # Escaped quotes
-    chunk4 = b'data: {"choices": [{"delta": {"content": "He said \\"hi\\""}}]}\n\n'
-    assert extract_content_from_sse_chunk(chunk4) == 'He said "hi"'
-
-    # Done chunk
-    chunk_done = b'data: [DONE]\n\n'
-    assert extract_content_from_sse_chunk(chunk_done) is None
+    assert [item async for item in iter_sse_events(upstream())] == [(event, expected)]
 
 
 @pytest.mark.asyncio
