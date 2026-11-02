@@ -403,6 +403,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 cached=False,
             )
 
+            await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + comp_tokens)
+
             choices = data.get("choices", [])
             content_text = choices[0]["message"]["content"] if choices else ""
             if content_text:
