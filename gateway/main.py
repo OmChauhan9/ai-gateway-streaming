@@ -45,6 +45,7 @@ from gateway.telemetry.prometheus import (
 )
 from gateway.upstream.client import (
     AsyncUpstreamClient,
+    UpstreamClientError,
     UpstreamConnectionError,
     UpstreamRateLimitedError,
     UpstreamServerError,
@@ -121,6 +122,13 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
     # Attach context to app state
     app.state.ctx = ctx
+
+    @app.exception_handler(UpstreamClientError)
+    async def relay_upstream_client_error(request: Request, exc: UpstreamClientError):
+        try:
+            return JSONResponse(status_code=exc.status_code, content=json.loads(exc.message))
+        except ValueError:
+            return PlainResponse(content=exc.message, status_code=exc.status_code)
 
     # -------------------------------------------------------------------------
     # Ingress Helper
@@ -249,7 +257,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                                 active_provider = fallback_prov
                                 fallback_diverted = True
                                 resp, t_upstream_start = await ctx.client.send_streaming_request(active_provider, payload)
-                            except Exception as fb_exc:
+                            except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as fb_exc:
                                 await fallback_prov.circuit_breaker.record_failure(fb_exc)
                                 ctx.otel.record_completion_telemetry(
                                     span, 0, 0, 0, fallback_used=True, error=str(fb_exc)
