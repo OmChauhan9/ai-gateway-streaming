@@ -164,4 +164,7 @@ class AsyncUpstreamClient:
             else:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
-        return resp.json(), t_start
+        try:
+            return resp.json(), t_start
+        except ValueError as exc:
+            raise UpstreamServerError(provider.name, resp.status_code, f"Malformed JSON body: {exc}") from exc
