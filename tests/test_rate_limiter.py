@@ -1,8 +1,11 @@
 """Unit and integration tests for Token Leaky-Bucket Rate Limiter."""
 
 import asyncio
+from types import SimpleNamespace
+
 import pytest
 from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
+from gateway.limiter import leaky_bucket
 from gateway.limiter.leaky_bucket import TokenLeakyBucketLimiter, RateLimitExceeded
 from gateway.schemas.openai import ChatMessage
 
@@ -71,6 +74,21 @@ async def test_leaky_bucket_drains_over_time():
     # Now an acquisition of 50 should succeed
     admitted, _ = await limiter.acquire("client_c", 50)
     assert admitted is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_prunes_buckets_that_drained_and_went_idle(monkeypatch):
+    limiter = TokenLeakyBucketLimiter(
+        capacity_tokens=50, leak_rate_tokens_per_second=10.0, cleanup_interval_seconds=0
+    )
+    for i in range(100):
+        await limiter.acquire(f"idle_{i}", 5)
+
+    two_hours_later = leaky_bucket.time.monotonic() + 7200
+    monkeypatch.setattr(leaky_bucket, "time", SimpleNamespace(monotonic=lambda: two_hours_later))
+    await limiter.acquire("active", 5)
+
+    assert set(limiter._buckets) == {"active"}, "drained buckets idle for 2h must be pruned"
 
 
 @pytest.mark.asyncio

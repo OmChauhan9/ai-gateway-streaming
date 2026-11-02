@@ -150,11 +150,12 @@ class TokenLeakyBucketLimiter:
             }
 
     def _cleanup_stale_buckets(self, now: float) -> None:
-        """Prune keys where level has been 0 for longer than 1 hour."""
+        """Prune keys that have drained to 0 and been idle for longer than 1 hour."""
         keys_to_delete = []
         for key, state in self._buckets.items():
-            delta = now - state.last_leak_time
-            if state.level <= 0.0 and delta > 3600.0:
+            idle = now - state.last_leak_time
+            self._leak(state, now)
+            if state.level <= 0.0 and idle > 3600.0:
                 keys_to_delete.append(key)
         for key in keys_to_delete:
             del self._buckets[key]
