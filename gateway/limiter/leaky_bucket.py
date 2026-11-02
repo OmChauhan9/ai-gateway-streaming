@@ -30,6 +30,18 @@ class RateLimitExceeded(Exception):
         )
 
 
+class RequestExceedsCapacity(Exception):
+    """Raised when a single request needs more tokens than the bucket can ever hold."""
+    def __init__(self, key: str, requested: int, capacity: int):
+        self.key = key
+        self.requested = requested
+        self.capacity = capacity
+        super().__init__(
+            f"Request for key '{key}' needs {requested} tokens, "
+            f"more than the bucket capacity of {capacity}."
+        )
+
+
 @dataclass
 class BucketState:
     """State tracking for a single rate limiter key."""
@@ -72,8 +84,11 @@ class TokenLeakyBucketLimiter:
             Tuple[bool, float]: (admitted, retry_after_seconds)
             
         Raises:
+            RequestExceedsCapacity if tokens exceed capacity, so waiting can never help.
             RateLimitExceeded if admitted is False.
         """
+        if tokens > self.capacity:
+            raise RequestExceedsCapacity(key=key, requested=tokens, capacity=int(self.capacity))
         now = time.monotonic()
         async with self._lock:
             # Periodic cleanup of empty buckets to prevent memory leak
@@ -135,11 +150,12 @@ class TokenLeakyBucketLimiter:
             }
 
     def _cleanup_stale_buckets(self, now: float) -> None:
-        """Prune keys where level has been 0 for longer than 1 hour."""
+        """Prune keys that have drained to 0 and been idle for longer than 1 hour."""
         keys_to_delete = []
         for key, state in self._buckets.items():
-            delta = now - state.last_leak_time
-            if state.level <= 0.0 and delta > 3600.0:
+            idle = now - state.last_leak_time
+            self._leak(state, now)
+            if state.level <= 0.0 and idle > 3600.0:
                 keys_to_delete.append(key)
         for key in keys_to_delete:
             del self._buckets[key]

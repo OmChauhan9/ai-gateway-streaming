@@ -1,8 +1,11 @@
 """Unit and integration tests for Token Leaky-Bucket Rate Limiter."""
 
 import asyncio
+from types import SimpleNamespace
+
 import pytest
 from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
+from gateway.limiter import leaky_bucket
 from gateway.limiter.leaky_bucket import TokenLeakyBucketLimiter, RateLimitExceeded
 from gateway.schemas.openai import ChatMessage
 
@@ -74,27 +77,56 @@ async def test_leaky_bucket_drains_over_time():
 
 
 @pytest.mark.asyncio
-async def test_gateway_429_endpoint_rejection(client):
-    # Set small capacity on test app limiter to trigger 429
-    gateway = client._transport.app  # FastAPI app
-    ctx = gateway.state.ctx
-    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
+async def test_cleanup_prunes_buckets_that_drained_and_went_idle(monkeypatch):
+    limiter = TokenLeakyBucketLimiter(
+        capacity_tokens=50, leak_rate_tokens_per_second=10.0, cleanup_interval_seconds=0
+    )
+    for i in range(100):
+        await limiter.acquire(f"idle_{i}", 5)
 
-    # Send large prompt that exceeds 50 tokens
-    large_prompt = "Tell me about deep learning. " * 30
+    two_hours_later = leaky_bucket.time.monotonic() + 7200
+    monkeypatch.setattr(leaky_bucket, "time", SimpleNamespace(monotonic=lambda: two_hours_later))
+    await limiter.acquire("active", 5)
+
+    assert set(limiter._buckets) == {"active"}, "drained buckets idle for 2h must be pruned"
+
+
+@pytest.mark.asyncio
+async def test_gateway_429_endpoint_rejection(client):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
     payload = {
         "model": "llama3-8b",
-        "messages": [{"role": "user", "content": large_prompt}],
+        "messages": [{"role": "user", "content": "x" * 120}],
         "stream": False,
     }
     headers = {"Authorization": "Bearer test-key-429"}
 
+    first = await client.post("/v1/chat/completions", json=payload, headers=headers)
+    assert first.status_code == 200, "a prompt that fits the empty bucket is admitted"
+
     resp = await client.post("/v1/chat/completions", json=payload, headers=headers)
     assert resp.status_code == 429
     assert "Retry-After" in resp.headers
-    body = resp.json()
-    assert "detail" in body
-    assert body["detail"]["error"]["type"] == "tokens_per_second_exceeded"
+    assert resp.json()["detail"]["error"]["type"] == "tokens_per_second_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_gateway_413_when_prompt_exceeds_bucket_capacity(client):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Tell me about deep learning. " * 30}],
+        "stream": False,
+    }
+
+    resp = await client.post(
+        "/v1/chat/completions", json=payload, headers={"Authorization": "Bearer test-key-413"}
+    )
+    assert resp.status_code == 413, "a prompt larger than capacity can never be admitted"
+    assert "Retry-After" not in resp.headers, "waiting cannot help, so no Retry-After"
+    assert resp.json()["detail"]["error"]["type"] == "request_exceeds_token_capacity"
 
 
 @pytest.mark.asyncio
