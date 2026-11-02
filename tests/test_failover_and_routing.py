@@ -209,6 +209,35 @@ async def test_provider_auth_rejection_fails_over(test_settings, stream, primary
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_provider_auth_rejection_with_open_fallback_returns_502(test_settings, stream):
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(401, json={"error": {"message": "Incorrect API key provided: sk-secret-1234"}})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    fallback_cb = gateway.state.ctx.registry.get_provider("mock-together-fallback").circuit_breaker
+    fallback_cb.recovery_timeout = 60.0
+    await fallback_cb.trip_manually()
+
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "bad key"}], "stream": stream}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["detail"]["error"]["type"] == "upstream_auth_failed"
+    assert "sk-secret-1234" not in resp.text, "provider body not echoed to the caller"
+    assert not any(":8002" in url for url in calls), "an OPEN fallback is not contacted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
 @pytest.mark.parametrize("fallback_fault", ["open", "503"])
 async def test_primary_failure_without_usable_fallback_returns_503(client, stream, fallback_fault):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
