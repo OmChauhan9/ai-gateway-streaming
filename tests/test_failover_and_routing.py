@@ -121,6 +121,43 @@ async def test_admin_manual_trip_endpoint(client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("primary_status, fallback_status", [(400, 200), (503, 400)], ids=["primary-400", "fallback-400"])
+async def test_upstream_client_error_is_relayed_without_failover(test_settings, stream, primary_status, fallback_status):
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    upstream_error = {"error": {"message": "maximum context length exceeded", "type": "invalid_request_error"}}
+    hits = {"mock-groq-primary": 0, "mock-together-fallback": 0}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        name = "mock-together-fallback" if ":8002" in str(request.url) else "mock-groq-primary"
+        hits[name] += 1
+        code = fallback_status if name == "mock-together-fallback" else primary_status
+        if code == 200:
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+        if code >= 500:
+            return httpx.Response(code, json={"error": {"message": "unavailable"}})
+        return httpx.Response(code, json=upstream_error)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    ctx = gateway.state.ctx
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "too long"}], "stream": stream}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == upstream_error, "upstream error body relayed"
+    rejecting = "mock-groq-primary" if primary_status == 400 else "mock-together-fallback"
+    metrics = await ctx.registry.get_provider(rejecting).circuit_breaker.get_metrics()
+    assert metrics["recent_failures_count"] == 0, "client error is not a provider failure"
+    if primary_status == 400:
+        assert hits["mock-together-fallback"] == 0, "no failover on a client error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
 @pytest.mark.parametrize("fallback_fault", ["open", "503"])
 async def test_primary_failure_without_usable_fallback_returns_503(client, stream, fallback_fault):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
