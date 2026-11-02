@@ -53,3 +53,28 @@ async def test_midstream_drop_interceptor_emits_error_frame():
     assert "upstream_connection_broken" in full_output
     assert "Remote server closed TCP connection abruptly" in full_output
     assert "data: [DONE]" in full_output
+
+
+@pytest.mark.asyncio
+async def test_error_frame_starts_a_fresh_event_after_upstream_dies_mid_event():
+    complete_event = b'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\n'
+
+    async def upstream_dies_mid_event():
+        yield complete_event
+        yield b'data: {"choices": [{"delta": {"conte'
+        raise ConnectionResetError("peer reset")
+
+    output = b""
+    async for chunk in telemetry_stream_interceptor(
+        upstream_stream=upstream_dies_mid_event(),
+        request_id="test-drop-partial",
+        provider_name="groq",
+        model_name="llama3-8b",
+        t_start=time.perf_counter(),
+    ):
+        output += chunk
+
+    assert output.startswith(complete_event), "the complete event is forwarded"
+    assert output[len(complete_event):].startswith(b"event: error\n"), (
+        "the incomplete event is withheld so the error frame opens a new event"
+    )
