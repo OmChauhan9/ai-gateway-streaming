@@ -95,12 +95,13 @@ Tested with `benchmarks/benchmark_overhead.py` (150 paired iterations) and `benc
 ### 1. Installation
 ```bash
 # Clone and enter directory
-cd "AI Gateway with Streaming Telemetry & Circuit Breaking."
+git clone https://github.com/OmChauhan9/ai-gateway-streaming.git
+cd ai-gateway-streaming
 
-# Create virtual environment and install dependencies
-uv venv --python python3
+# Create virtual environment and install dependencies (dev extra includes pytest and locust)
+uv venv
 source .venv/bin/activate
-uv pip install -e .
+uv pip install -e ".[dev]"
 ```
 
 ### 2. Run Synthetic Multi-Provider Upstreams
@@ -205,9 +206,9 @@ curl -X POST http://127.0.0.1:8000/v1/circuit-breakers/groq/reset
 
 For detailed architectural, theoretical, and operational documentation:
 
-1. **[EXPLANATION_AND_THEORY.md](file:///Users/omchauhan/Desktop/AI:ML%20Projects/AI%20Gateway%20with%20Streaming%20Telemetry%20&%20Circuit%20Breaking./EXPLANATION_AND_THEORY.md)**:
+1. **[EXPLANATION_AND_THEORY.md](EXPLANATION_AND_THEORY.md)**:
    - Deep-dive into inference economics, TTFT / TPOT mathematical formulas, Leaky Bucket calculus, Circuit Breaker state machines, and RFC 8895 SSE byte stream specifications.
    - Comprehensive bibliography of all official web links, RFCs, and documentation.
-2. **[WORKFLOW_AND_LIFECYCLE.md](file:///Users/omchauhan/Desktop/AI:ML%20Projects/AI%20Gateway%20with%20Streaming%20Telemetry%20&%20Circuit%20Breaking./WORKFLOW_AND_LIFECYCLE.md)**:
+2. **[WORKFLOW_AND_LIFECYCLE.md](WORKFLOW_AND_LIFECYCLE.md)**:
    - End-to-end 10-stage request lifecycle breakdown.
    - 5 Mermaid sequence diagrams detailing Happy Path, Transparent Failover, Rate Limiting, Cache Hits, and Mid-Stream Drop handling.
