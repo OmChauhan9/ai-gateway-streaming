@@ -1,6 +1,10 @@
 """Integration tests for Observability, Prometheus metrics, and OpenTelemetry instrumentation."""
 
+import re
+
 import pytest
+
+from gateway.limiter.leaky_bucket import TokenLeakyBucketLimiter
 
 
 @pytest.mark.asyncio
@@ -35,3 +39,35 @@ async def test_health_endpoint(client):
     assert data["status"] in ("healthy", "degraded")
     assert "providers" in data
     assert "mock-groq-primary" in data["providers"]
+
+
+def _rate_limit_exceeded_total(metrics_text: str) -> float:
+    match = re.search(r"^llm_rate_limit_exceeded_total (\S+)$", metrics_text, re.MULTILINE)
+    return float(match.group(1)) if match else 0.0
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_metric_counts_rejections_without_exposing_credentials(client):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=10, leak_rate_tokens_per_second=0.001)
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    }
+    tokens = ["sk-telemetry-secret-alpha", "sk-telemetry-secret-beta"]
+
+    before = _rate_limit_exceeded_total((await client.get("/metrics")).text)
+    for token in tokens:
+        headers = {"Authorization": f"Bearer {token}"}
+        first = await client.post("/v1/chat/completions", json=payload, headers=headers)
+        assert first.status_code == 200, "the first small prompt fits the bucket"
+        resp = await client.post("/v1/chat/completions", json=payload, headers=headers)
+        assert resp.status_code == 429, "the repeat overflows the bucket and is rate limited"
+    metrics_text = (await client.get("/metrics")).text
+
+    for token in tokens:
+        assert token not in metrics_text, "bearer token must not appear on /metrics"
+    assert _rate_limit_exceeded_total(metrics_text) - before == len(tokens), (
+        "unlabeled counter should count each rate-limited request once"
+    )

@@ -90,7 +90,6 @@ class PrometheusMetricsRegistry:
         self.rate_limit_exceeded_total = Counter(
             "llm_rate_limit_exceeded_total",
             "Total requests rejected by Token Leaky-Bucket Limiter",
-            ["client_key"],
             registry=self.registry,
         )
 
@@ -143,8 +142,8 @@ class PrometheusMetricsRegistry:
     def record_circuit_trip(self, provider: str) -> None:
         self.circuit_trips_total.labels(provider=provider).inc()
 
-    def record_rate_limit(self, client_key: str) -> None:
-        self.rate_limit_exceeded_total.labels(client_key=client_key).inc()
+    def record_rate_limit(self) -> None:
+        self.rate_limit_exceeded_total.inc()
 
     def record_cache_hit(self, cache_type: str = "exact") -> None:
         self.cache_hits_total.labels(cache_type=cache_type).inc()
