@@ -130,6 +130,108 @@ async def test_admin_manual_trip_endpoint(client):
     assert primary_cb.state == CircuitState.CLOSED
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("primary_status, fallback_status", [(400, 200), (503, 400)], ids=["primary-400", "fallback-400"])
+async def test_upstream_client_error_is_relayed_without_failover(test_settings, stream, primary_status, fallback_status):
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    upstream_error = {"error": {"message": "maximum context length exceeded", "type": "invalid_request_error"}}
+    hits = {"mock-groq-primary": 0, "mock-together-fallback": 0}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        name = "mock-together-fallback" if ":8002" in str(request.url) else "mock-groq-primary"
+        hits[name] += 1
+        code = fallback_status if name == "mock-together-fallback" else primary_status
+        if code == 200:
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+        if code >= 500:
+            return httpx.Response(code, json={"error": {"message": "unavailable"}})
+        return httpx.Response(code, json=upstream_error)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    ctx = gateway.state.ctx
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "too long"}], "stream": stream}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == upstream_error, "upstream error body relayed"
+    rejecting = "mock-groq-primary" if primary_status == 400 else "mock-together-fallback"
+    metrics = await ctx.registry.get_provider(rejecting).circuit_breaker.get_metrics()
+    assert metrics["recent_failures_count"] == 0, "client error is not a provider failure"
+    if primary_status == 400:
+        assert hits["mock-together-fallback"] == 0, "no failover on a client error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("fallback_fault", ["open", "503"])
+async def test_primary_failure_without_usable_fallback_returns_503(client, stream, fallback_fault):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    gateway = client._transport.app
+    ctx = gateway.state.ctx
+    primary_cb = ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    fallback_cb = ctx.registry.get_provider("mock-together-fallback").circuit_breaker
+    spans = InMemorySpanExporter()
+    ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/fault-injection", json={"fail_with_status": 503})
+    if fallback_fault == "open":
+        fallback_cb.recovery_timeout = 60.0
+        await client.post("/v1/circuit-breakers/mock-together-fallback/trip")
+    else:
+        async with httpx_client_for(gateway.state.fallback_mock_app) as adm:
+            await adm.post("/admin/fault-injection", json={"fail_with_status": 503})
+
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": f"No usable fallback {stream} {fallback_fault}"}],
+        "stream": stream,
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"]["error"]["type"] == "all_providers_unavailable"
+    primary_failures = (await primary_cb.get_metrics())["recent_failures_count"]
+    assert primary_failures == 1, "primary failure recorded exactly once"
+    fallback_failures = (await fallback_cb.get_metrics())["recent_failures_count"]
+    assert fallback_failures == (0 if fallback_fault == "open" else 1), "fallback failure recorded once, only if contacted"
+    ended = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    assert len(ended) == 1, "inference span ended"
+    spans.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_nonstream_non_json_200_fails_over_to_fallback(test_settings):
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if ":8002" in str(request.url):
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "from fallback"}}]})
+        return httpx.Response(200, headers={"Content-Type": "text/html"}, text="<html><body>Bad gateway</body></html>")
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    primary_cb = gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "malformed primary"}], "stream": False}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
+    assert resp.json()["choices"][0]["message"]["content"] == "from fallback"
+    assert (await primary_cb.get_metrics())["recent_failures_count"] == 1, "malformed body counts as a primary failure"
+
+
 def httpx_client_for(app):
     """Helper to communicate with an in-memory FastAPI app directly."""
     import httpx
