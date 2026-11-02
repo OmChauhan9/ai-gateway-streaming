@@ -119,6 +119,47 @@ async def test_admin_manual_trip_endpoint(client):
     assert primary_cb.state == CircuitState.CLOSED
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("fallback_fault", ["open", "503"])
+async def test_primary_failure_without_usable_fallback_returns_503(client, stream, fallback_fault):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    gateway = client._transport.app
+    ctx = gateway.state.ctx
+    primary_cb = ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    fallback_cb = ctx.registry.get_provider("mock-together-fallback").circuit_breaker
+    spans = InMemorySpanExporter()
+    ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/fault-injection", json={"fail_with_status": 503})
+    if fallback_fault == "open":
+        fallback_cb.recovery_timeout = 60.0
+        await client.post("/v1/circuit-breakers/mock-together-fallback/trip")
+    else:
+        async with httpx_client_for(gateway.state.fallback_mock_app) as adm:
+            await adm.post("/admin/fault-injection", json={"fail_with_status": 503})
+
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": f"No usable fallback {stream} {fallback_fault}"}],
+        "stream": stream,
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"]["error"]["type"] == "all_providers_unavailable"
+    primary_failures = (await primary_cb.get_metrics())["recent_failures_count"]
+    assert primary_failures == 1, "primary failure recorded exactly once"
+    fallback_failures = (await fallback_cb.get_metrics())["recent_failures_count"]
+    assert fallback_failures == (0 if fallback_fault == "open" else 1), "fallback failure recorded once, only if contacted"
+    ended = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    assert len(ended) == 1, "inference span ended"
+    spans.shutdown()
+
+
 def httpx_client_for(app):
     """Helper to communicate with an in-memory FastAPI app directly."""
     import httpx
