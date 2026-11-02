@@ -169,6 +169,46 @@ async def test_upstream_client_error_is_relayed_without_failover(test_settings, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize(
+    "primary_status, fallback_status, expected_status",
+    [(401, 200, 200), (403, 200, 200), (401, 401, 502)],
+    ids=["primary-401", "primary-403", "both-401"],
+)
+async def test_provider_auth_rejection_fails_over(test_settings, stream, primary_status, fallback_status, expected_status):
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    provider_body = "Incorrect API key provided: sk-secret-1234"
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        code = fallback_status if ":8002" in str(request.url) else primary_status
+        if code == 200:
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+        return httpx.Response(code, json={"error": {"message": provider_body, "type": "invalid_api_key"}})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    registry = gateway.state.ctx.registry
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "bad key"}], "stream": stream}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == expected_status, resp.text
+    primary_metrics = await registry.get_provider("mock-groq-primary").circuit_breaker.get_metrics()
+    assert primary_metrics["recent_failures_count"] == 1, "auth rejection counts as a primary failure"
+    if expected_status == 200:
+        assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
+        assert resp.headers.get("X-Gateway-Fallback") == "true"
+    else:
+        assert resp.json()["detail"]["error"]["type"] == "upstream_auth_failed"
+        assert "sk-secret-1234" not in resp.text, "provider body not echoed to the caller"
+        fallback_metrics = await registry.get_provider("mock-together-fallback").circuit_breaker.get_metrics()
+        assert fallback_metrics["recent_failures_count"] == 1, "auth rejection counts as a fallback failure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
 @pytest.mark.parametrize("fallback_fault", ["open", "503"])
 async def test_primary_failure_without_usable_fallback_returns_503(client, stream, fallback_fault):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
