@@ -37,8 +37,14 @@ class UpstreamServerError(UpstreamException):
         super().__init__(provider, status_code, message)
 
 
+class UpstreamAuthError(UpstreamException):
+    """HTTP 401/403 from upstream: the provider rejected the gateway's own API key."""
+    def __init__(self, provider: str, status_code: int, message: str):
+        super().__init__(provider, status_code, message)
+
+
 class UpstreamClientError(UpstreamException):
-    """HTTP 4xx Client Error (excluding 429) from upstream."""
+    """HTTP 4xx Client Error (excluding 401, 403, 429) from upstream."""
     def __init__(self, provider: str, status_code: int, message: str):
         super().__init__(provider, status_code, message)
 
@@ -129,6 +135,8 @@ class AsyncUpstreamClient:
                 raise UpstreamRateLimitedError(provider.name, body_text)
             elif resp.status_code >= 500:
                 raise UpstreamServerError(provider.name, resp.status_code, body_text)
+            elif resp.status_code in (401, 403):
+                raise UpstreamAuthError(provider.name, resp.status_code, body_text)
             else:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
@@ -163,6 +171,8 @@ class AsyncUpstreamClient:
                 raise UpstreamRateLimitedError(provider.name, body_text)
             elif resp.status_code >= 500:
                 raise UpstreamServerError(provider.name, resp.status_code, body_text)
+            elif resp.status_code in (401, 403):
+                raise UpstreamAuthError(provider.name, resp.status_code, body_text)
             else:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
