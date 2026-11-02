@@ -1,7 +1,8 @@
 """High-speed exact and normalized semantic cache for LLM requests.
 
-Eliminates redundant upstream model invocations by hashing canonical request structures
-(model, normalized messages, temperature, top_p) with time-to-live (TTL) expiration.
+Eliminates redundant upstream model invocations by hashing every request field that can
+change the generated output (model, normalized messages, sampling and length parameters)
+with time-to-live (TTL) expiration.
 """
 
 import hashlib
@@ -33,16 +34,12 @@ class SemanticCache:
 
     def _generate_key(self, request: ChatCompletionRequest) -> str:
         """Derive a deterministic SHA256 key from canonical request parameters."""
-        normalized_messages = [
-            {"role": m.role, "content": m.content.strip()}
-            for m in request.messages
-        ]
-        key_payload = {
-            "model": request.model,
-            "messages": normalized_messages,
-            "temperature": request.temperature if request.temperature is not None else 1.0,
-            "top_p": request.top_p if request.top_p is not None else 1.0,
-        }
+        # Exclude only fields that cannot change the generated text, so any new
+        # generation parameter is keyed by default. `stream` is excluded because
+        # a hit is replayed in whichever shape the new request asks for.
+        key_payload = request.model_dump(exclude={"stream", "user"})
+        for message in key_payload["messages"]:
+            message["content"] = message["content"].strip()
         serialized = json.dumps(key_payload, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -74,7 +71,7 @@ class SemanticCache:
         usage: Optional[dict] = None,
     ) -> None:
         """Store completion in cache."""
-        if not self.enabled:
+        if not self.enabled or self.max_size <= 0:
             return
 
         if len(self._store) >= self.max_size:

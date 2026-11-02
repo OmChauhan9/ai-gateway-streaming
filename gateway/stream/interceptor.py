@@ -13,7 +13,7 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, List, Optional
 from gateway.schemas.gateway_models import StreamTelemetryData
 from gateway.stream.error_frames import generate_sse_error_frame
-from gateway.stream.sse_parser import extract_content_from_sse_chunk
+from gateway.stream.sse_parser import iter_sse_events
 
 
 async def telemetry_stream_interceptor(
@@ -48,11 +48,9 @@ async def telemetry_stream_interceptor(
     accumulated_content: List[str] = []
 
     try:
-        async for chunk in upstream_stream:
+        async for event, content in iter_sse_events(upstream_stream):
             now = time.perf_counter()
 
-            # Fast inspection of chunk content
-            content = extract_content_from_sse_chunk(chunk)
             if content:
                 token_count += 1
                 accumulated_content.append(content)
@@ -70,8 +68,8 @@ async def telemetry_stream_interceptor(
 
                 t_last = now
 
-            # Yield raw byte chunk immediately to the client stream without delay
-            yield chunk
+            # Forward only complete events, so an error frame never lands mid-event.
+            yield event
 
         # End of stream reached successfully
         t_end = time.perf_counter()

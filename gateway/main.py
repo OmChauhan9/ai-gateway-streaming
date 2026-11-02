@@ -26,7 +26,7 @@ from gateway.circuit_breaker.provider_registry import (
     ProviderRegistry,
 )
 from gateway.circuit_breaker.state_machine import CircuitState
-from gateway.limiter.leaky_bucket import RateLimitExceeded, TokenLeakyBucketLimiter
+from gateway.limiter.leaky_bucket import RateLimitExceeded, RequestExceedsCapacity, TokenLeakyBucketLimiter
 from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
 from gateway.schemas.gateway_models import HealthResponse, StreamTelemetryData
 from gateway.schemas.openai import (
@@ -45,6 +45,7 @@ from gateway.telemetry.prometheus import (
 )
 from gateway.upstream.client import (
     AsyncUpstreamClient,
+    UpstreamClientError,
     UpstreamConnectionError,
     UpstreamRateLimitedError,
     UpstreamServerError,
@@ -122,6 +123,13 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     # Attach context to app state
     app.state.ctx = ctx
 
+    @app.exception_handler(UpstreamClientError)
+    async def relay_upstream_client_error(request: Request, exc: UpstreamClientError):
+        try:
+            return JSONResponse(status_code=exc.status_code, content=json.loads(exc.message))
+        except ValueError:
+            return PlainResponse(content=exc.message, status_code=exc.status_code)
+
     # -------------------------------------------------------------------------
     # Ingress Helper
     # -------------------------------------------------------------------------
@@ -131,6 +139,24 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             return authorization[7:].strip()
         client_host = request.client.host if request.client else "unknown_client"
         return client_host
+
+    async def _fail_over(send, payload: ChatCompletionRequest, primary_exc: Exception, span):
+        """After the primary failed, serve from the fallback or raise a 503."""
+        fallback = ctx.registry.get_provider(ctx.registry.fallback_name)
+        allowed, _, _ = await fallback.circuit_breaker.can_execute()
+        if not allowed:
+            message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
+        else:
+            try:
+                return fallback, *await send(fallback, payload)
+            except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as fb_exc:
+                await fallback.circuit_breaker.record_failure(fb_exc)
+                message = f"Both primary and fallback failed: {fb_exc}"
+        ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=allowed, error=message)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": {"message": message, "type": "all_providers_unavailable"}},
+        )
 
     # -------------------------------------------------------------------------
     # Core Endpoint: POST /v1/chat/completions
@@ -151,6 +177,19 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if ctx.settings.rate_limiter_enabled:
             try:
                 await ctx.limiter.acquire(client_key, prompt_tokens)
+            except RequestExceedsCapacity as rec:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"Request needs an estimated {rec.requested} tokens, more than the "
+                                f"token capacity of {rec.capacity}. Retrying will not help; shorten the prompt."
+                            ),
+                            "type": "request_exceeds_token_capacity",
+                        }
+                    },
+                )
             except RateLimitExceeded as rle:
                 ctx.metrics.record_rate_limit()
                 headers = {"Retry-After": str(int(rle.retry_after) + 1)}
@@ -203,6 +242,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     headers={"X-Cache": "HIT", "X-Gateway-Request-Id": req_id},
                 )
 
+        cache_status_headers = {"X-Cache": "MISS"} if ctx.cache.enabled else {}
+
         # 3. Circuit Breaker & Provider Selection
         try:
             target_provider, is_fallback = await ctx.registry.select_provider_for_request()
@@ -241,23 +282,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
                 # Attempt transparent fallback if available
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    fallback_prov = ctx.registry.get_provider(ctx.registry.fallback_name)
-                    if fallback_prov:
-                        allowed, _, _ = await fallback_prov.circuit_breaker.can_execute()
-                        if allowed:
-                            try:
-                                active_provider = fallback_prov
-                                fallback_diverted = True
-                                resp, t_upstream_start = await ctx.client.send_streaming_request(active_provider, payload)
-                            except Exception as fb_exc:
-                                await fallback_prov.circuit_breaker.record_failure(fb_exc)
-                                ctx.otel.record_completion_telemetry(
-                                    span, 0, 0, 0, fallback_used=True, error=str(fb_exc)
-                                )
-                                raise HTTPException(
-                                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                    detail={"error": {"message": f"Both primary and fallback failed: {str(fb_exc)}"}},
-                                )
+                    active_provider, resp, t_upstream_start = await _fail_over(
+                        ctx.client.send_streaming_request, payload, exc, span
+                    )
+                    fallback_diverted = True
                 else:
                     ctx.otel.record_completion_telemetry(
                         span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
@@ -354,6 +382,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 "X-Gateway-Request-Id": req_id,
                 "X-Gateway-Provider": active_provider.name,
                 "X-Gateway-Fallback": str(fallback_diverted).lower(),
+                **cache_status_headers,
             }
 
             return StreamingResponse(interceptor, media_type="text/event-stream", headers=headers)
@@ -365,13 +394,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as exc:
                 await active_provider.circuit_breaker.record_failure(exc)
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    fallback_prov = ctx.registry.get_provider(ctx.registry.fallback_name)
-                    if fallback_prov:
-                        active_provider = fallback_prov
-                        fallback_diverted = True
-                        data, t_upstream_start = await ctx.client.send_non_streaming_request(active_provider, payload)
-                    else:
-                        raise HTTPException(status_code=502, detail=f"Upstream error: {str(exc)}")
+                    active_provider, data, t_upstream_start = await _fail_over(
+                        ctx.client.send_non_streaming_request, payload, exc, span
+                    )
+                    fallback_diverted = True
                 else:
                     raise HTTPException(status_code=502, detail=f"Upstream error: {str(exc)}")
 
@@ -403,6 +429,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 cached=False,
             )
 
+            await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + comp_tokens)
+
             choices = data.get("choices", [])
             content_text = choices[0]["message"]["content"] if choices else ""
             if content_text:
@@ -412,6 +440,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 "X-Gateway-Request-Id": req_id,
                 "X-Gateway-Provider": active_provider.name,
                 "X-Gateway-Fallback": str(fallback_diverted).lower(),
+                **cache_status_headers,
             }
             return JSONResponse(content=data, headers=headers)
 
