@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com)
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-GenAI%20Conventions-purple.svg)](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
-[![Tests](https://img.shields.io/badge/Tests-22%20Passed-brightgreen.svg)]()
+[![CI](https://github.com/OmChauhan9/ai-gateway-streaming/actions/workflows/ci.yml/badge.svg)](https://github.com/OmChauhan9/ai-gateway-streaming/actions/workflows/ci.yml)
 [![Gateway Overhead](https://img.shields.io/badge/p90%20Overhead-%3C%204.4ms-success.svg)]()
 
 A production-grade **Async AI Gateway & Reverse Proxy** engineered for high-concurrency LLM inference. Deploys the true layer between production applications and foundation model APIs: **non-blocking streaming Server-Sent Events (SSE) byte processing**, **Time To First Token (TTFT)** & **Time Per Output Token (TPOT)** profiling, **Token Leaky-Bucket Rate Limiting**, and automated **tri-state Circuit Breaking with transparent multi-provider failover**.
