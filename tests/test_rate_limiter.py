@@ -75,23 +75,37 @@ async def test_leaky_bucket_drains_over_time():
 
 @pytest.mark.asyncio
 async def test_gateway_429_endpoint_rejection(client):
-    # Set small capacity on test app limiter to trigger 429
-    gateway = client._transport.app  # FastAPI app
-    ctx = gateway.state.ctx
+    ctx = client._transport.app.state.ctx
     ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
-
-    # Send large prompt that exceeds 50 tokens
-    large_prompt = "Tell me about deep learning. " * 30
     payload = {
         "model": "llama3-8b",
-        "messages": [{"role": "user", "content": large_prompt}],
+        "messages": [{"role": "user", "content": "x" * 120}],
         "stream": False,
     }
     headers = {"Authorization": "Bearer test-key-429"}
 
+    first = await client.post("/v1/chat/completions", json=payload, headers=headers)
+    assert first.status_code == 200, "a prompt that fits the empty bucket is admitted"
+
     resp = await client.post("/v1/chat/completions", json=payload, headers=headers)
     assert resp.status_code == 429
     assert "Retry-After" in resp.headers
-    body = resp.json()
-    assert "detail" in body
-    assert body["detail"]["error"]["type"] == "tokens_per_second_exceeded"
+    assert resp.json()["detail"]["error"]["type"] == "tokens_per_second_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_gateway_413_when_prompt_exceeds_bucket_capacity(client):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Tell me about deep learning. " * 30}],
+        "stream": False,
+    }
+
+    resp = await client.post(
+        "/v1/chat/completions", json=payload, headers={"Authorization": "Bearer test-key-413"}
+    )
+    assert resp.status_code == 413, "a prompt larger than capacity can never be admitted"
+    assert "Retry-After" not in resp.headers, "waiting cannot help, so no Retry-After"
+    assert resp.json()["detail"]["error"]["type"] == "request_exceeds_token_capacity"
