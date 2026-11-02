@@ -242,6 +242,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     headers={"X-Cache": "HIT", "X-Gateway-Request-Id": req_id},
                 )
 
+        cache_status_headers = {"X-Cache": "MISS"} if ctx.cache.enabled else {}
+
         # 3. Circuit Breaker & Provider Selection
         try:
             target_provider, is_fallback = await ctx.registry.select_provider_for_request()
@@ -380,6 +382,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 "X-Gateway-Request-Id": req_id,
                 "X-Gateway-Provider": active_provider.name,
                 "X-Gateway-Fallback": str(fallback_diverted).lower(),
+                **cache_status_headers,
             }
 
             return StreamingResponse(interceptor, media_type="text/event-stream", headers=headers)
@@ -437,6 +440,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 "X-Gateway-Request-Id": req_id,
                 "X-Gateway-Provider": active_provider.name,
                 "X-Gateway-Fallback": str(fallback_diverted).lower(),
+                **cache_status_headers,
             }
             return JSONResponse(content=data, headers=headers)
 
