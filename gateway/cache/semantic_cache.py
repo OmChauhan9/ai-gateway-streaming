@@ -71,7 +71,7 @@ class SemanticCache:
         usage: Optional[dict] = None,
     ) -> None:
         """Store completion in cache."""
-        if not self.enabled:
+        if not self.enabled or self.max_size <= 0:
             return
 
         if len(self._store) >= self.max_size:
