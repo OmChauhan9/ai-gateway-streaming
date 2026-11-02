@@ -82,3 +82,18 @@ async def test_telemetry_stream_interceptor_profiling():
 
     # TPOT should reflect ~10ms per token (4 intervals across 5 tokens)
     assert 5.0 <= collected_telemetry.tpot_ms <= 30.0
+
+
+@pytest.mark.asyncio
+async def test_streamed_completion_arrives_in_multiple_chunks(client):
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Chunked delivery through the gateway"}],
+        "stream": True,
+    }
+    async with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        chunks = [chunk async for chunk in resp.aiter_raw()]
+
+    assert resp.status_code == 200
+    assert len(chunks) > 1, "the SSE body reaches the client as the gateway sends it, not as one buffered chunk"
+    assert b"".join(chunks).endswith(b"data: [DONE]\n\n")
