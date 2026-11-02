@@ -49,7 +49,7 @@ def _rate_limit_exceeded_total(metrics_text: str) -> float:
 @pytest.mark.asyncio
 async def test_rate_limit_metric_counts_rejections_without_exposing_credentials(client):
     ctx = client._transport.app.state.ctx
-    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=1, leak_rate_tokens_per_second=0.001)
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=10, leak_rate_tokens_per_second=0.001)
     payload = {
         "model": "llama3-8b",
         "messages": [{"role": "user", "content": "hi"}],
@@ -59,10 +59,11 @@ async def test_rate_limit_metric_counts_rejections_without_exposing_credentials(
 
     before = _rate_limit_exceeded_total((await client.get("/metrics")).text)
     for token in tokens:
-        resp = await client.post(
-            "/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {token}"}
-        )
-        assert resp.status_code == 429, "request should be rate limited"
+        headers = {"Authorization": f"Bearer {token}"}
+        first = await client.post("/v1/chat/completions", json=payload, headers=headers)
+        assert first.status_code == 200, "the first small prompt fits the bucket"
+        resp = await client.post("/v1/chat/completions", json=payload, headers=headers)
+        assert resp.status_code == 429, "the repeat overflows the bucket and is rate limited"
     metrics_text = (await client.get("/metrics")).text
 
     for token in tokens:
