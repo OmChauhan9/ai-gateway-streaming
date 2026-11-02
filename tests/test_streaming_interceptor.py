@@ -155,3 +155,18 @@ async def test_multiline_data_with_any_line_ending_fed_byte_by_byte(eol):
     assert forwarded == stream, "the client receives every upstream byte"
     assert telemetry.accumulated_text == "Hi!", "data lines join with LF and every line ending ends a line"
     assert telemetry.completion_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_streamed_completion_arrives_in_multiple_chunks(client):
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Chunked delivery through the gateway"}],
+        "stream": True,
+    }
+    async with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        chunks = [chunk async for chunk in resp.aiter_raw()]
+
+    assert resp.status_code == 200
+    assert len(chunks) > 1, "the SSE body reaches the client as the gateway sends it, not as one buffered chunk"
+    assert b"".join(chunks).endswith(b"data: [DONE]\n\n")
