@@ -45,6 +45,7 @@ from gateway.telemetry.prometheus import (
 )
 from gateway.upstream.client import (
     AsyncUpstreamClient,
+    UpstreamClientError,
     UpstreamConnectionError,
     UpstreamRateLimitedError,
     UpstreamServerError,
@@ -122,6 +123,13 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     # Attach context to app state
     app.state.ctx = ctx
 
+    @app.exception_handler(UpstreamClientError)
+    async def relay_upstream_client_error(request: Request, exc: UpstreamClientError):
+        try:
+            return JSONResponse(status_code=exc.status_code, content=json.loads(exc.message))
+        except ValueError:
+            return PlainResponse(content=exc.message, status_code=exc.status_code)
+
     # -------------------------------------------------------------------------
     # Ingress Helper
     # -------------------------------------------------------------------------
@@ -131,6 +139,24 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             return authorization[7:].strip()
         client_host = request.client.host if request.client else "unknown_client"
         return client_host
+
+    async def _fail_over(send, payload: ChatCompletionRequest, primary_exc: Exception, span):
+        """After the primary failed, serve from the fallback or raise a 503."""
+        fallback = ctx.registry.get_provider(ctx.registry.fallback_name)
+        allowed, _, _ = await fallback.circuit_breaker.can_execute()
+        if not allowed:
+            message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
+        else:
+            try:
+                return fallback, *await send(fallback, payload)
+            except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as fb_exc:
+                await fallback.circuit_breaker.record_failure(fb_exc)
+                message = f"Both primary and fallback failed: {fb_exc}"
+        ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=allowed, error=message)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": {"message": message, "type": "all_providers_unavailable"}},
+        )
 
     # -------------------------------------------------------------------------
     # Core Endpoint: POST /v1/chat/completions
@@ -241,23 +267,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
                 # Attempt transparent fallback if available
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    fallback_prov = ctx.registry.get_provider(ctx.registry.fallback_name)
-                    if fallback_prov:
-                        allowed, _, _ = await fallback_prov.circuit_breaker.can_execute()
-                        if allowed:
-                            try:
-                                active_provider = fallback_prov
-                                fallback_diverted = True
-                                resp, t_upstream_start = await ctx.client.send_streaming_request(active_provider, payload)
-                            except Exception as fb_exc:
-                                await fallback_prov.circuit_breaker.record_failure(fb_exc)
-                                ctx.otel.record_completion_telemetry(
-                                    span, 0, 0, 0, fallback_used=True, error=str(fb_exc)
-                                )
-                                raise HTTPException(
-                                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                    detail={"error": {"message": f"Both primary and fallback failed: {str(fb_exc)}"}},
-                                )
+                    active_provider, resp, t_upstream_start = await _fail_over(
+                        ctx.client.send_streaming_request, payload, exc, span
+                    )
+                    fallback_diverted = True
                 else:
                     ctx.otel.record_completion_telemetry(
                         span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
@@ -365,13 +378,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as exc:
                 await active_provider.circuit_breaker.record_failure(exc)
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    fallback_prov = ctx.registry.get_provider(ctx.registry.fallback_name)
-                    if fallback_prov:
-                        active_provider = fallback_prov
-                        fallback_diverted = True
-                        data, t_upstream_start = await ctx.client.send_non_streaming_request(active_provider, payload)
-                    else:
-                        raise HTTPException(status_code=502, detail=f"Upstream error: {str(exc)}")
+                    active_provider, data, t_upstream_start = await _fail_over(
+                        ctx.client.send_non_streaming_request, payload, exc, span
+                    )
+                    fallback_diverted = True
                 else:
                     raise HTTPException(status_code=502, detail=f"Upstream error: {str(exc)}")
 
