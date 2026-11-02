@@ -118,8 +118,10 @@ class AsyncUpstreamClient:
         # Check status code before streaming body
         if resp.status_code >= 400:
             try:
-                body_bytes = await resp.aread()
-                body_text = body_bytes.decode("utf-8", errors="ignore")
+                body_text = (await resp.aread()).decode("utf-8", errors="ignore")
+            except httpx.HTTPError as exc:
+                # The status line already says what failed; a lost error body must not hide it.
+                body_text = f"<error body unreadable: {exc}>"
             finally:
                 await resp.aclose()
 
@@ -164,4 +166,7 @@ class AsyncUpstreamClient:
             else:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
-        return resp.json(), t_start
+        try:
+            return resp.json(), t_start
+        except ValueError as exc:
+            raise UpstreamServerError(provider.name, resp.status_code, f"Malformed JSON body: {exc}") from exc
