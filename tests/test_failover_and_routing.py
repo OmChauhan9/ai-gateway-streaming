@@ -62,6 +62,15 @@ async def test_circuit_trips_to_open_after_threshold(client):
     fallback_app = gateway.state.fallback_mock_app
     ctx = gateway.state.ctx
     primary_cb = ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    primary_cb.recovery_timeout = 60.0
+    primary_hits = 0
+
+    @primary_app.middleware("http")
+    async def count_primary_hits(request, call_next):
+        nonlocal primary_hits
+        if request.url.path.endswith("/chat/completions"):
+            primary_hits += 1
+        return await call_next(request)
 
     # Inject 500 error on primary
     async with httpx_client_for(primary_app) as adm:
@@ -86,9 +95,11 @@ async def test_circuit_trips_to_open_after_threshold(client):
         "messages": [{"role": "user", "content": "New prompt when circuit is open"}],
         "stream": True,
     }
+    hits_before = primary_hits
     resp = await client.post("/v1/chat/completions", json=next_payload)
     assert resp.status_code == 200
     assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
+    assert primary_hits == hits_before, "OPEN circuit kept the request off the primary"
 
     # Reset
     await primary_cb.reset_manually()
