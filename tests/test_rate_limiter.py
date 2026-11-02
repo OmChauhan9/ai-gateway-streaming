@@ -95,3 +95,24 @@ async def test_gateway_429_endpoint_rejection(client):
     body = resp.json()
     assert "detail" in body
     assert body["detail"]["error"]["type"] == "tokens_per_second_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_request_charges_upstream_completion_tokens(client):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=100000, leak_rate_tokens_per_second=1e-9)
+    messages = [{"role": "user", "content": "hi"}]
+    headers = {"Authorization": "Bearer test-key-reconcile"}
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"model": "llama3-8b", "messages": messages, "stream": False},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    completion_tokens = resp.json()["usage"]["completion_tokens"]
+    assert completion_tokens > 0
+
+    status = (await client.get("/v1/rate-limiter/status", headers=headers)).json()["bucket"]
+    expected = estimate_prompt_tokens([ChatMessage(**m) for m in messages]) + completion_tokens
+    assert status["level"] == expected, "bucket holds the prompt estimate plus upstream completion tokens"
