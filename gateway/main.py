@@ -152,7 +152,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             try:
                 await ctx.limiter.acquire(client_key, prompt_tokens)
             except RateLimitExceeded as rle:
-                ctx.metrics.record_rate_limit(client_key)
+                ctx.metrics.record_rate_limit()
                 headers = {"Retry-After": str(int(rle.retry_after) + 1)}
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
