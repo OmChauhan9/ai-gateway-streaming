@@ -188,21 +188,27 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         return HTTPException(status_code=status_code, detail=detail)
 
     async def _fail_over(send, payload: ChatCompletionRequest, primary_exc: Exception, span):
-        """After the primary failed, serve from the fallback or raise a 503 (502 on a provider auth rejection)."""
+        """After the primary failed, serve from the fallback or raise a 503 (502 on a provider auth rejection).
+
+        Returns the fallback, its permit to settle, and the result of `send`.
+        """
         fallback = ctx.registry.get_provider(ctx.registry.fallback_name)
-        allowed, _, _ = await fallback.circuit_breaker.can_execute()
+        permit = fallback.circuit_breaker.try_acquire()
         last_exc = primary_exc
-        if not allowed:
+        if permit is None:
             message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
         else:
             span.set_attribute("gen_ai.system", fallback.name)
             try:
-                return fallback, await send(fallback, payload)
+                return fallback, permit, await send(fallback, payload)
             except PROVIDER_FAILURES as fb_exc:
                 last_exc = fb_exc
-                await fallback.circuit_breaker.record_failure(fb_exc)
+                permit.fail()
                 message = f"Both primary and fallback failed: {fb_exc}"
-        ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=allowed, error=message)
+            except BaseException:
+                permit.abandon()
+                raise
+        ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=permit is not None, error=message)
         raise _cannot_serve(
             last_exc,
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -297,7 +303,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
         # 3. Circuit Breaker & Provider Selection
         try:
-            target_provider, is_fallback = await ctx.registry.select_provider_for_request()
+            target_provider, permit, is_fallback = ctx.registry.admit()
         except AllProvidersUnavailableException as apue:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -323,7 +329,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 resp = await ctx.client.send_streaming_request(active_provider, payload)
             except PROVIDER_FAILURES as exc:
                 # Primary failed before headers committed! Trip circuit & failover
-                await active_provider.circuit_breaker.record_failure(exc)
+                permit.fail()
                 ctx.metrics.set_circuit_state(
                     active_provider.name, active_provider.circuit_breaker.state.value
                 )
@@ -332,7 +338,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
                 # Attempt transparent fallback if available
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    active_provider, resp = await _fail_over(
+                    active_provider, permit, resp = await _fail_over(
                         ctx.client.send_streaming_request, payload, exc, span
                     )
                     fallback_diverted = True
@@ -345,13 +351,16 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream failure: {str(exc)}", "type": "upstream_error"}},
                     )
+            except BaseException:
+                permit.abandon()
+                raise
 
             # 5. Non-Blocking SSE Streaming Interceptor
             accumulated_tokens: list[str] = []
 
             async def on_stream_complete(telemetry: StreamTelemetryData):
                 # Upstream succeeded!
-                await active_provider.circuit_breaker.record_success()
+                permit.succeed()
                 ctx.metrics.set_circuit_state(
                     active_provider.name, active_provider.circuit_breaker.state.value
                 )
@@ -393,7 +402,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
             async def on_stream_error(exc: Exception):
                 # Mid-stream error
-                await active_provider.circuit_breaker.record_failure(exc)
+                permit.fail()
                 ctx.metrics.set_circuit_state(
                     active_provider.name, active_provider.circuit_breaker.state.value
                 )
@@ -446,6 +455,14 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 on_client_disconnect=on_client_disconnect,
             )
 
+            async def settled_body() -> AsyncIterator[bytes]:
+                # A body cut short, as by a client disconnect, gives the permit back without a verdict.
+                try:
+                    async for chunk in interceptor:
+                        yield chunk
+                finally:
+                    permit.abandon()
+
             headers = {
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
@@ -456,16 +473,16 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 **cache_status_headers,
             }
 
-            return StreamingResponse(interceptor, media_type="text/event-stream", headers=headers)
+            return StreamingResponse(settled_body(), media_type="text/event-stream", headers=headers)
 
         else:
             # Non-streaming Request
             try:
                 data = await ctx.client.send_non_streaming_request(active_provider, payload)
             except PROVIDER_FAILURES as exc:
-                await active_provider.circuit_breaker.record_failure(exc)
+                permit.fail()
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    active_provider, data = await _fail_over(
+                    active_provider, permit, data = await _fail_over(
                         ctx.client.send_non_streaming_request, payload, exc, span
                     )
                     fallback_diverted = True
@@ -475,12 +492,14 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream error: {str(exc)}", "type": "upstream_error"}},
                     )
+            except BaseException:
+                permit.abandon()
+                raise
+            permit.succeed()
 
             total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
             usage = data.get("usage", {})
             comp_tokens = usage.get("completion_tokens", 0)
-
-            await active_provider.circuit_breaker.record_success()
 
             ctx.metrics.record_request_metrics(
                 provider=active_provider.name,

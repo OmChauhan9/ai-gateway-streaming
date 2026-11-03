@@ -303,6 +303,77 @@ async def test_nonstream_non_json_200_fails_over_to_fallback(test_settings):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_half_open_sends_one_probe_to_the_primary(test_settings, stream):
+    import asyncio
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    primary_hits = 0
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal primary_hits
+        if ":8002" not in str(request.url):
+            primary_hits += 1
+            await asyncio.sleep(0.2)
+            return httpx.Response(503, json={"error": {"message": "still down"}})
+        if stream:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n',
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        await c.post("/v1/circuit-breakers/mock-groq-primary/trip")
+        await asyncio.sleep(test_settings.cb_recovery_timeout_seconds + 0.05)
+        responses = await asyncio.gather(*(
+            c.post("/v1/chat/completions", json={
+                "model": "llama3-8b",
+                "messages": [{"role": "user", "content": f"half-open {i}"}],
+                "stream": stream,
+            })
+            for i in range(20)
+        ))
+
+    assert [r.status_code for r in responses] == [200] * 20, "every request is served"
+    assert primary_hits == 1, "HALF-OPEN sends a single probe to the broken primary"
+
+
+@pytest.mark.asyncio
+async def test_disconnected_probe_frees_the_half_open_slot(client):
+    import asyncio
+
+    gateway = client._transport.app
+    primary_cb = gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/fault-injection", json={"added_tpot_delay_ms": 200})
+    await client.post("/v1/circuit-breakers/mock-groq-primary/trip")
+    await asyncio.sleep(primary_cb.recovery_timeout + 0.05)
+
+    def chat(content):
+        return {"model": "llama3-8b", "messages": [{"role": "user", "content": content}], "stream": True}
+
+    async with client.stream("POST", "/v1/chat/completions", json=chat("probe then disconnect")) as probe:
+        assert probe.headers.get("X-Gateway-Provider") == "mock-groq-primary"
+        async for _ in probe.aiter_bytes():
+            break
+
+    assert primary_cb.state == CircuitState.HALF_OPEN, "a disconnect is not a failure"
+    assert (await primary_cb.get_metrics())["half_open_successes"] == 0, "a disconnect is not a success"
+    async with client.stream("POST", "/v1/chat/completions", json=chat("next probe")) as nxt:
+        assert nxt.headers.get("X-Gateway-Provider") == "mock-groq-primary", "the next request takes the freed probe slot"
+
+    await primary_cb.reset_manually()
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/reset")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
 async def test_fallback_failure_after_primary_open_returns_openai_error_body(client, stream):
     gateway = client._transport.app
     primary_cb = gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
