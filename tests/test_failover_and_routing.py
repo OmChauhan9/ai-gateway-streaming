@@ -343,6 +343,35 @@ async def test_half_open_sends_one_probe_to_the_primary(test_settings, stream):
     assert primary_hits == 1, "HALF-OPEN sends a single probe to the broken primary"
 
 
+@pytest.mark.asyncio
+async def test_disconnected_probe_frees_the_half_open_slot(client):
+    import asyncio
+
+    gateway = client._transport.app
+    primary_cb = gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/fault-injection", json={"added_tpot_delay_ms": 200})
+    await client.post("/v1/circuit-breakers/mock-groq-primary/trip")
+    await asyncio.sleep(primary_cb.recovery_timeout + 0.05)
+
+    def chat(content):
+        return {"model": "llama3-8b", "messages": [{"role": "user", "content": content}], "stream": True}
+
+    async with client.stream("POST", "/v1/chat/completions", json=chat("probe then disconnect")) as probe:
+        assert probe.headers.get("X-Gateway-Provider") == "mock-groq-primary"
+        async for _ in probe.aiter_bytes():
+            break
+
+    assert primary_cb.state == CircuitState.HALF_OPEN, "a disconnect is not a failure"
+    assert (await primary_cb.get_metrics())["half_open_successes"] == 0, "a disconnect is not a success"
+    async with client.stream("POST", "/v1/chat/completions", json=chat("next probe")) as nxt:
+        assert nxt.headers.get("X-Gateway-Provider") == "mock-groq-primary", "the next request takes the freed probe slot"
+
+    await primary_cb.reset_manually()
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/reset")
+
+
 def httpx_client_for(app):
     """Helper to communicate with an in-memory FastAPI app directly."""
     import httpx

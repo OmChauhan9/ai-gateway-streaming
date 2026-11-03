@@ -6,7 +6,7 @@ Coordinates transparent failover from Primary to Secondary providers.
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from gateway.circuit_breaker.state_machine import CircuitBreaker, CircuitState
+from gateway.circuit_breaker.state_machine import CircuitBreaker, Permit
 
 
 class AllProvidersUnavailableException(Exception):
@@ -60,6 +60,7 @@ class ProviderRegistry:
             failure_window_seconds=self.failure_window,
             recovery_timeout_seconds=self.recovery_timeout,
             half_open_success_threshold=self.half_open_success_threshold,
+            probe_lease_seconds=timeout_seconds,
         )
         info = ProviderInfo(
             name=name,
@@ -80,28 +81,28 @@ class ProviderRegistry:
     def get_provider(self, name: str) -> Optional[ProviderInfo]:
         return self._providers.get(name)
 
-    async def select_provider_for_request(self) -> Tuple[ProviderInfo, bool]:
-        """Select healthy provider to service the request.
-        
+    def admit(self) -> Tuple[ProviderInfo, Permit, bool]:
+        """Admit the request to a provider whose breaker accepts it.
+
         Returns:
-            Tuple[ProviderInfo, bool]: (selected_provider, is_fallback_diverted)
-            
+            Tuple[ProviderInfo, Permit, bool]: (selected_provider, permit_to_settle, is_fallback_diverted)
+
         Raises:
             AllProvidersUnavailableException: If no provider can take traffic.
         """
         # 1. Inspect Primary Provider
         if self.primary_name and self.primary_name in self._providers:
             primary = self._providers[self.primary_name]
-            allowed, state, cooldown = await primary.circuit_breaker.can_execute()
-            if allowed:
-                return primary, False
+            permit = primary.circuit_breaker.try_acquire()
+            if permit is not None:
+                return primary, permit, False
 
-        # 2. Primary is OPEN or missing -> Evaluate Fallback Provider
+        # 2. Primary is refusing traffic or missing -> Evaluate Fallback Provider
         if self.fallback_name and self.fallback_name in self._providers:
             fallback = self._providers[self.fallback_name]
-            allowed, state, cooldown = await fallback.circuit_breaker.can_execute()
-            if allowed:
-                return fallback, True
+            permit = fallback.circuit_breaker.try_acquire()
+            if permit is not None:
+                return fallback, permit, True
 
         # 3. Both are unavailable
         raise AllProvidersUnavailableException(

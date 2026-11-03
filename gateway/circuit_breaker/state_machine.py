@@ -3,19 +3,28 @@
 Protects the gateway and upstream providers from cascading failures:
 - CLOSED: Requests pass freely. Failures increment a sliding/rolling counter.
 - OPEN: Fast-fail immediately without hitting the broken upstream.
-- HALF-OPEN: After recovery cooldown expires, permits limited test probes to verify upstream health.
+- HALF-OPEN: After recovery cooldown expires, admits one trial probe at a time to verify upstream health.
+
+Every admission is a Permit stamped with the breaker's epoch, which changes on every state change.
+Only a permit from the current epoch, and in HALF-OPEN only the probe, can move the state.
 """
 
-import asyncio
 from enum import Enum
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 class CircuitState(str, Enum):
     CLOSED = "CLOSED"
     OPEN = "OPEN"
     HALF_OPEN = "HALF-OPEN"
+
+
+class Outcome(Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    # No verdict on the upstream, such as a client disconnect. Frees a probe slot, counts as neither.
+    ABANDONED = "abandoned"
 
 
 class CircuitBreakerOpenException(Exception):
@@ -29,8 +38,32 @@ class CircuitBreakerOpenException(Exception):
         )
 
 
+class Permit:
+    """One admission to the upstream. The first of succeed, fail or abandon settles it; later calls do nothing."""
+
+    __slots__ = ("_breaker", "epoch", "outcome")
+
+    def __init__(self, breaker: "CircuitBreaker", epoch: int):
+        self._breaker = breaker
+        self.epoch = epoch
+        self.outcome: Optional[Outcome] = None
+
+    def succeed(self) -> None:
+        self._breaker._settle(self, Outcome.SUCCESS)
+
+    def fail(self) -> None:
+        self._breaker._settle(self, Outcome.FAILURE)
+
+    def abandon(self) -> None:
+        self._breaker._settle(self, Outcome.ABANDONED)
+
+
 class CircuitBreaker:
-    """Thread-safe, asynchronous tri-state Circuit Breaker."""
+    """Tri-state Circuit Breaker, confined to one event loop.
+
+    Admission and settlement are synchronous, so no request can interleave inside them, and a
+    cancelled request can settle its permit from a finally block without awaiting.
+    """
 
     def __init__(
         self,
@@ -39,19 +72,23 @@ class CircuitBreaker:
         failure_window_seconds: float = 10.0,
         recovery_timeout_seconds: float = 15.0,
         half_open_success_threshold: int = 2,
+        probe_lease_seconds: float = 30.0,
     ):
         self.name = name
         self.failure_threshold = failure_threshold
         self.failure_window = failure_window_seconds
         self.recovery_timeout = recovery_timeout_seconds
         self.half_open_success_threshold = half_open_success_threshold
+        self.probe_lease = probe_lease_seconds
 
         self._state: CircuitState = CircuitState.CLOSED
+        self._epoch: int = 0
         self._failure_timestamps: List[float] = []
         self._half_open_successes: int = 0
+        self._probe: Optional[Permit] = None
+        self._probe_expires_at: float = 0.0
         self._last_state_change: float = time.monotonic()
         self._last_failure_timestamp: Optional[float] = None
-        self._lock = asyncio.Lock()
 
     @property
     def state(self) -> CircuitState:
@@ -62,101 +99,80 @@ class CircuitBreaker:
         cutoff = now - self.failure_window
         self._failure_timestamps = [t for t in self._failure_timestamps if t >= cutoff]
 
-    async def can_execute(self) -> Tuple[bool, CircuitState, float]:
-        """Check whether a request is allowed to hit upstream.
-        
-        Returns:
-            Tuple[bool, CircuitState, float]: (allowed, current_state, cooldown_remaining)
-        """
+    def try_acquire(self) -> Optional[Permit]:
+        """Admit one request to the upstream, or return None when the breaker refuses it."""
         now = time.monotonic()
-        async with self._lock:
-            # Check if OPEN state has expired and should transition to HALF-OPEN
-            if self._state == CircuitState.OPEN:
-                elapsed = now - self._last_state_change
-                if elapsed >= self.recovery_timeout:
-                    self._state = CircuitState.HALF_OPEN
-                    self._half_open_successes = 0
-                    self._last_state_change = now
-                    return True, self._state, 0.0
-                else:
-                    cooldown_remaining = max(0.0, self.recovery_timeout - elapsed)
-                    return False, self._state, cooldown_remaining
+        if self._state == CircuitState.OPEN and now - self._last_state_change >= self.recovery_timeout:
+            self._transition(CircuitState.HALF_OPEN, now)
 
-            elif self._state == CircuitState.HALF_OPEN:
-                # In HALF-OPEN, permit trial probe
-                return True, self._state, 0.0
+        if self._state == CircuitState.OPEN:
+            return None
+        if self._state == CircuitState.HALF_OPEN:
+            # A probe that never settles (its response body never started) loses the slot when its lease ends.
+            if self._probe is not None and now < self._probe_expires_at:
+                return None
+            self._probe = Permit(self, self._epoch)
+            self._probe_expires_at = now + self.probe_lease
+            return self._probe
+        return Permit(self, self._epoch)
 
-            else:  # CLOSED
-                return True, self._state, 0.0
-
-    async def record_success(self) -> None:
-        """Record a successful response from upstream."""
+    def _settle(self, permit: Permit, outcome: Outcome) -> None:
+        if permit.outcome is not None:
+            return
+        permit.outcome = outcome
         now = time.monotonic()
-        async with self._lock:
-            if self._state == CircuitState.HALF_OPEN:
+        if outcome == Outcome.FAILURE:
+            self._last_failure_timestamp = now
+
+        if permit.epoch != self._epoch:
+            return
+        if self._state == CircuitState.HALF_OPEN:
+            if permit is not self._probe:
+                return
+            self._probe = None
+            if outcome == Outcome.SUCCESS:
                 self._half_open_successes += 1
                 if self._half_open_successes >= self.half_open_success_threshold:
-                    # Upstream proven recovered! Reset to CLOSED
-                    self._state = CircuitState.CLOSED
-                    self._failure_timestamps.clear()
-                    self._half_open_successes = 0
-                    self._last_state_change = now
+                    self._transition(CircuitState.CLOSED, now)
+            elif outcome == Outcome.FAILURE:
+                self._transition(CircuitState.OPEN, now)
+        elif outcome == Outcome.FAILURE:
+            self._failure_timestamps.append(now)
+            self._clean_old_failures(now)
+            if len(self._failure_timestamps) >= self.failure_threshold:
+                self._transition(CircuitState.OPEN, now)
 
-            elif self._state == CircuitState.CLOSED:
-                # In closed state, periodically keep failures clean
-                self._clean_old_failures(now)
-
-    async def record_failure(self, error: Optional[Exception] = None) -> None:
-        """Record an upstream failure (5xx, 429, timeout, network error)."""
-        now = time.monotonic()
-        async with self._lock:
-            self._last_failure_timestamp = now
-            if self._state == CircuitState.CLOSED:
-                self._failure_timestamps.append(now)
-                self._clean_old_failures(now)
-                if len(self._failure_timestamps) >= self.failure_threshold:
-                    # Trip to OPEN
-                    self._state = CircuitState.OPEN
-                    self._last_state_change = now
-
-            elif self._state == CircuitState.HALF_OPEN:
-                # A single failure in HALF-OPEN immediately trips back to OPEN
-                self._state = CircuitState.OPEN
-                self._half_open_successes = 0
-                self._last_state_change = now
-
-            elif self._state == CircuitState.OPEN:
-                # Already OPEN; update timestamp
-                self._last_failure_timestamp = now
+    def _transition(self, new_state: CircuitState, now: float) -> None:
+        """Enter a state. The new epoch makes every permit issued before it stale."""
+        self._state = new_state
+        self._epoch += 1
+        self._last_state_change = now
+        self._half_open_successes = 0
+        self._probe = None
+        if new_state == CircuitState.CLOSED:
+            self._failure_timestamps.clear()
 
     async def get_metrics(self) -> Dict[str, any]:
         """Snapshot current circuit breaker status."""
         now = time.monotonic()
-        async with self._lock:
-            self._clean_old_failures(now)
-            elapsed = now - self._last_state_change
-            cooldown_rem = max(0.0, self.recovery_timeout - elapsed) if self._state == CircuitState.OPEN else 0.0
-            return {
-                "name": self.name,
-                "state": self._state.value,
-                "recent_failures_count": len(self._failure_timestamps),
-                "failure_threshold": self.failure_threshold,
-                "half_open_successes": self._half_open_successes,
-                "half_open_threshold": self.half_open_success_threshold,
-                "cooldown_remaining_seconds": round(cooldown_rem, 2),
-                "last_failure_time": self._last_failure_timestamp,
-            }
+        self._clean_old_failures(now)
+        elapsed = now - self._last_state_change
+        cooldown_rem = max(0.0, self.recovery_timeout - elapsed) if self._state == CircuitState.OPEN else 0.0
+        return {
+            "name": self.name,
+            "state": self._state.value,
+            "recent_failures_count": len(self._failure_timestamps),
+            "failure_threshold": self.failure_threshold,
+            "half_open_successes": self._half_open_successes,
+            "half_open_threshold": self.half_open_success_threshold,
+            "cooldown_remaining_seconds": round(cooldown_rem, 2),
+            "last_failure_time": self._last_failure_timestamp,
+        }
 
     async def trip_manually(self) -> None:
         """Force the circuit breaker to OPEN state (for testing/maintenance)."""
-        async with self._lock:
-            self._state = CircuitState.OPEN
-            self._last_state_change = time.monotonic()
+        self._transition(CircuitState.OPEN, time.monotonic())
 
     async def reset_manually(self) -> None:
         """Reset the circuit breaker to CLOSED state."""
-        async with self._lock:
-            self._state = CircuitState.CLOSED
-            self._failure_timestamps.clear()
-            self._half_open_successes = 0
-            self._last_state_change = time.monotonic()
+        self._transition(CircuitState.CLOSED, time.monotonic())
