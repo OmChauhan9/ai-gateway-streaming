@@ -26,14 +26,19 @@ def test_token_estimation():
     assert 8 <= prompt_tokens <= 18
 
 
-def test_token_estimate_for_a_null_content_tool_call_message_is_small_and_positive():
-    message = ChatMessage(
-        role="assistant",
-        content=None,
-        tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "w", "arguments": "{}"}}],
-    )
+def test_token_estimate_for_a_null_content_tool_call_message_counts_its_arguments():
+    def tool_call_turn(arguments: str) -> ChatMessage:
+        return ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "w", "arguments": arguments}}],
+        )
 
-    assert 0 < estimate_prompt_tokens([message]) < 20
+    small = estimate_prompt_tokens([tool_call_turn("{}")])
+    large = estimate_prompt_tokens([tool_call_turn("{}" + " " * 400)])
+
+    assert small > 0
+    assert 95 <= large - small <= 105, "400 more characters of arguments cost about 100 tokens"
 
 
 def test_text_parts_are_estimated_like_the_same_text_as_a_string():
@@ -144,6 +149,40 @@ async def test_gateway_413_when_prompt_exceeds_bucket_capacity(client):
     assert resp.status_code == 413, "a prompt larger than capacity can never be admitted"
     assert "Retry-After" not in resp.headers, "waiting cannot help, so no Retry-After"
     assert resp.json()["detail"]["error"]["type"] == "request_exceeds_token_capacity"
+
+
+LONG_TEXT = "Tell me about deep learning. " * 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"messages": [{"role": "user", "content": LONG_TEXT}]},
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "description": LONG_TEXT, "parameters": {"type": "object"}}}],
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": LONG_TEXT}}]},
+            ]
+        },
+    ],
+    ids=["in_content", "in_top_level_field", "in_message_field"],
+)
+async def test_forwarded_fields_count_toward_the_token_capacity(client, fields):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"model": "llama3-8b", "stream": False, **fields},
+        headers={"Authorization": "Bearer test-key-forwarded-413"},
+    )
+
+    assert resp.status_code == 413, "text the upstream receives is budgeted wherever in the request it sits"
 
 
 @pytest.mark.asyncio
