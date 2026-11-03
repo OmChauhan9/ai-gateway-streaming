@@ -36,7 +36,7 @@ async def telemetry_stream_interceptor(
         request_id: Unique correlation ID
         provider_name: Selected upstream provider name
         model_name: Model identifier
-        t_start: Monotonic timestamp when upstream request was initiated
+        t_start: Monotonic timestamp when the gateway received the request
         prompt_tokens: Estimated prompt tokens
         fallback_used: Whether failover occurred
         on_stream_complete: Coroutine invoked with finalized telemetry data

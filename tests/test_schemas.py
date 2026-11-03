@@ -34,6 +34,15 @@ def test_invalid_chat_request_empty_messages():
         )
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [("temperature", 2.5), ("top_p", 1.5), ("n", 0), ("max_tokens", 0), ("presence_penalty", -3.0), ("frequency_penalty", 3.0)],
+)
+def test_out_of_range_sampling_params_are_rejected(field, value):
+    with pytest.raises(ValidationError):
+        ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **{field: value})
+
+
 def test_chunk_serialization():
     chunk = ChatCompletionChunk(
         model="llama3-8b",
