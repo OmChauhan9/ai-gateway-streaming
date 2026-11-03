@@ -102,7 +102,8 @@ async def test_latency_after_failover_counts_from_gateway_ingress(test_settings,
             return httpx.Response(503, json={"error": {"message": "primary down"}})
         if stream:
             chunk = {"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]}
-            body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+            done = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            body = f"data: {json.dumps(chunk)}\n\ndata: {json.dumps(done)}\n\ndata: [DONE]\n\n"
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=body)
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "hi"}}]})
 
