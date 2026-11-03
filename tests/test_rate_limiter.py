@@ -26,6 +26,28 @@ def test_token_estimation():
     assert 8 <= prompt_tokens <= 18
 
 
+def test_token_estimate_for_a_null_content_tool_call_message_counts_its_arguments():
+    def tool_call_turn(arguments: str) -> ChatMessage:
+        return ChatMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "w", "arguments": arguments}}],
+        )
+
+    small = estimate_prompt_tokens([tool_call_turn("{}")])
+    large = estimate_prompt_tokens([tool_call_turn("{}" + " " * 400)])
+
+    assert small > 0
+    assert 95 <= large - small <= 105, "400 more characters of arguments cost about 100 tokens"
+
+
+def test_text_parts_are_estimated_like_the_same_text_as_a_string():
+    as_parts = ChatMessage(role="user", content=[{"type": "text", "text": "What is the speed of light?"}])
+    as_string = ChatMessage(role="user", content="What is the speed of light?")
+
+    assert estimate_prompt_tokens([as_parts]) == estimate_prompt_tokens([as_string])
+
+
 @pytest.mark.asyncio
 async def test_leaky_bucket_basic_acquire():
     limiter = TokenLeakyBucketLimiter(capacity_tokens=500, leak_rate_tokens_per_second=100.0)
@@ -149,8 +171,15 @@ LONG_TEXT = "Tell me about deep learning. " * 30
                 {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": LONG_TEXT}}]},
             ]
         },
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": LONG_TEXT}}]},
+            ]
+        },
+        {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "annotation": LONG_TEXT}]}]},
     ],
-    ids=["in_content", "in_top_level_field", "in_message_field"],
+    ids=["in_content", "in_top_level_field", "in_message_field", "in_null_content_tool_calls", "in_text_part_field"],
 )
 async def test_forwarded_fields_count_toward_the_token_capacity(client, fields):
     ctx = client._transport.app.state.ctx

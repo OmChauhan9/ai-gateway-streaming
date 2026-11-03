@@ -89,7 +89,7 @@ class AsyncUpstreamClient:
         """Initiate upstream streaming connection and return the open streaming response."""
         url = f"{provider.base_url}/chat/completions"
         headers = self._prepare_headers(provider)
-        payload = request.model_dump(exclude_none=True)
+        payload = request.model_dump(exclude_unset=True)
         # Ensure stream is True
         payload["stream"] = True
 
@@ -144,7 +144,7 @@ class AsyncUpstreamClient:
         """Dispatch non-streaming completion call."""
         url = f"{provider.base_url}/chat/completions"
         headers = self._prepare_headers(provider)
-        payload = request.model_dump(exclude_none=True)
+        payload = request.model_dump(exclude_unset=True)
         payload["stream"] = False
 
         timeout = httpx.Timeout(timeout=provider.timeout_seconds, connect=5.0)

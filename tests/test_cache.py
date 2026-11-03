@@ -149,6 +149,34 @@ async def test_response_the_cache_cannot_replay_comes_from_the_upstream_every_ti
 
 
 @pytest.mark.asyncio
+async def test_cache_key_distinguishes_tool_calls(client):
+    def tool_loop_turn(city: str) -> dict:
+        return {
+            "model": "llama3-8b",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "w", "arguments": f"{{\"city\": \"{city}\"}}"}}],
+                },
+                {"role": "tool", "content": "18C", "tool_call_id": "call_1"},
+            ],
+            "stream": False,
+        }
+
+    resp1 = await client.post("/v1/chat/completions", json=tool_loop_turn("Paris"))
+    assert resp1.status_code == 200, resp1.text
+
+    resp2 = await client.post("/v1/chat/completions", json=tool_loop_turn("Rome"))
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.headers.get("X-Cache") != "HIT", "a different tool call must not replay the cached response"
+
+    resp3 = await client.post("/v1/chat/completions", json=tool_loop_turn("Rome"))
+    assert resp3.headers.get("X-Cache") == "HIT", "an identical tool-loop turn still hits the cache"
+
+
+@pytest.mark.asyncio
 async def test_cache_max_size_zero_serves_requests_without_caching(mock_apps, test_settings):
     primary_app, fallback_app = mock_apps
     upstream = AsyncUpstreamClient(transport=MultiAppTransport(primary_app, fallback_app))

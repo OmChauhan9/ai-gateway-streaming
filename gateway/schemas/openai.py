@@ -5,7 +5,15 @@ Faithful implementation of the standard OpenAI v1 REST specification.
 
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class TextContentPart(BaseModel):
+    """One `{"type": "text"}` entry of a message's list-form content."""
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["text"]
+    text: str
 
 
 class ChatMessage(BaseModel):
@@ -13,8 +21,17 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: Literal["system", "user", "assistant", "function", "tool"] = "user"
-    content: str
+    # Null for an assistant turn that only carries tool_calls. Non-text parts (images, audio)
+    # stay rejected because the token estimator has no way to count them.
+    content: Optional[Union[str, List[TextContentPart]]]
     name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _always_forward_role(self) -> "ChatMessage":
+        # The upstream dump keeps only fields the client set, but upstreams reject a
+        # message with no role, so the "user" default must still be sent.
+        self.model_fields_set.add("role")
+        return self
 
 
 class ChatCompletionRequest(BaseModel):
