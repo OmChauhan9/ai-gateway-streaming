@@ -201,7 +201,7 @@ async def test_provider_auth_rejection_fails_over(test_settings, stream, primary
         assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
         assert resp.headers.get("X-Gateway-Fallback") == "true"
     else:
-        assert resp.json()["detail"]["error"]["type"] == "upstream_auth_failed"
+        assert resp.json()["error"]["type"] == "upstream_auth_failed"
         assert "sk-secret-1234" not in resp.text, "provider body not echoed to the caller"
         fallback_metrics = await registry.get_provider("mock-together-fallback").circuit_breaker.get_metrics()
         assert fallback_metrics["recent_failures_count"] == 1, "auth rejection counts as a fallback failure"
@@ -231,7 +231,7 @@ async def test_provider_auth_rejection_with_open_fallback_returns_502(test_setti
         resp = await c.post("/v1/chat/completions", json=payload)
 
     assert resp.status_code == 502, resp.text
-    assert resp.json()["detail"]["error"]["type"] == "upstream_auth_failed"
+    assert resp.json()["error"]["type"] == "upstream_auth_failed"
     assert "sk-secret-1234" not in resp.text, "provider body not echoed to the caller"
     assert not any(":8002" in url for url in calls), "an OPEN fallback is not contacted"
 
@@ -267,7 +267,7 @@ async def test_primary_failure_without_usable_fallback_returns_503(client, strea
     resp = await client.post("/v1/chat/completions", json=payload)
 
     assert resp.status_code == 503, resp.text
-    assert resp.json()["detail"]["error"]["type"] == "all_providers_unavailable"
+    assert resp.json()["error"]["type"] == "all_providers_unavailable"
     primary_failures = (await primary_cb.get_metrics())["recent_failures_count"]
     assert primary_failures == 1, "primary failure recorded exactly once"
     fallback_failures = (await fallback_cb.get_metrics())["recent_failures_count"]
@@ -299,6 +299,26 @@ async def test_nonstream_non_json_200_fails_over_to_fallback(test_settings):
     assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
     assert resp.json()["choices"][0]["message"]["content"] == "from fallback"
     assert (await primary_cb.get_metrics())["recent_failures_count"] == 1, "malformed body counts as a primary failure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_fallback_failure_after_primary_open_returns_openai_error_body(client, stream):
+    gateway = client._transport.app
+    primary_cb = gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    primary_cb.recovery_timeout = 60.0
+    await primary_cb.trip_manually()
+    async with httpx_client_for(gateway.state.fallback_mock_app) as adm:
+        await adm.post("/admin/fault-injection", json={"fail_with_status": 503})
+
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": f"fallback down {stream}"}], "stream": stream}
+    resp = await client.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 502, resp.text
+    body = resp.json()
+    assert list(body) == ["error"], "OpenAI clients read a top-level error object"
+    assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+    assert body["error"]["type"] == "upstream_error"
 
 
 @pytest.mark.asyncio
