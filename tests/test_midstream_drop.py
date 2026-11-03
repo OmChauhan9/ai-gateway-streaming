@@ -1,5 +1,7 @@
 """Integration tests for handling upstream mid-stream disconnection edge cases."""
 
+import asyncio
+import re
 import time
 import httpx
 import pytest
@@ -198,3 +200,109 @@ async def test_truncated_stream_is_not_cached_and_counts_as_provider_failure(tes
     ended = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
     assert [s.status.status_code for s in ended] == [StatusCode.ERROR] * 2, "each span ends with the error"
     spans.shutdown()
+
+
+def _disconnect_reporting_interceptor(upstream, disconnects):
+    async def on_disconnect(completion_tokens):
+        disconnects.append(completion_tokens)
+
+    return telemetry_stream_interceptor(
+        upstream_stream=upstream,
+        request_id="test-disconnect",
+        provider_name="groq",
+        model_name="llama3-8b",
+        t_start=time.perf_counter(),
+        on_client_disconnect=on_disconnect,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_awaiting_upstream_reports_streamed_tokens_and_propagates():
+    async def stalled_upstream():
+        yield CONTENT_EVENT
+        await asyncio.Event().wait()
+
+    disconnects, received = [], []
+    stream = _disconnect_reporting_interceptor(stalled_upstream(), disconnects)
+
+    async def consume():
+        async for chunk in stream:
+            received.append(chunk)
+
+    task = asyncio.create_task(consume())
+    while not received:
+        await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert disconnects == [1], "the one streamed token is reported once"
+
+
+@pytest.mark.asyncio
+async def test_close_while_parked_at_yield_reports_streamed_tokens():
+    disconnects = []
+
+    async def upstream():
+        yield CONTENT_EVENT + CONTENT_EVENT + FINISH_EVENT
+
+    stream = _disconnect_reporting_interceptor(upstream(), disconnects)
+    assert await stream.__anext__() == CONTENT_EVENT
+    await stream.aclose()
+
+    assert disconnects == [1], "the one forwarded token is reported once"
+
+
+def _requests_total(metrics_text: str, status: str) -> float:
+    labels = f'model="llama3-8b",provider="mock-groq-primary",status="{status}",stream="true"'
+    match = re.search(rf"^llm_requests_total\{{{labels}\}} (\S+)$", metrics_text, re.MULTILINE)
+    return float(match.group(1)) if match else 0.0
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_mid_stream_is_counted_and_reconciled(client, gateway_app):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+    from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens
+    from gateway.schemas.openai import ChatMessage
+
+    ctx = gateway_app.state.ctx
+    ctx.limiter.leak_rate = 1e-9
+    spans = InMemorySpanExporter()
+    ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=gateway_app.state.primary_mock_app), base_url="http://primary"
+    ) as admin:
+        await admin.post("/admin/fault-injection", json={"added_tpot_delay_ms": 200})
+    primary_cb = ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    await client.post("/v1/circuit-breakers/mock-groq-primary/trip")
+    await asyncio.sleep(0.25)
+
+    messages = [{"role": "user", "content": "Client leaves after the first token"}]
+    payload = {"model": "llama3-8b", "messages": messages, "stream": True}
+    auth = {"Authorization": "Bearer disconnect-client"}
+    before = (await client.get("/metrics")).text
+    async with client.stream("POST", "/v1/chat/completions", json=payload, headers=auth) as resp:
+        request_id = resp.headers["X-Gateway-Request-Id"]
+        async for chunk in resp.aiter_raw():
+            if b'"content"' in chunk:
+                break
+    after = (await client.get("/metrics")).text
+
+    assert _requests_total(after, "499") - _requests_total(before, "499") == 1, "the request is counted as client-closed"
+    assert _requests_total(after, "200") == _requests_total(before, "200"), "the request is not counted as a success"
+    prompt_tokens = estimate_prompt_tokens([ChatMessage(**m) for m in messages])
+    bucket = (await client.get("/v1/rate-limiter/status", headers=auth)).json()["bucket"]
+    assert bucket["level"] == pytest.approx(prompt_tokens + 1), "the one streamed completion token is charged"
+    ended = [s for s in spans.get_finished_spans() if s.attributes.get("gateway.request_id") == request_id]
+    assert len(ended) == 1, "the span is ended"
+    assert ended[0].attributes.get("gateway.client_disconnected") is True, "the span is marked as cancelled by the client"
+    assert ended[0].status.status_code == StatusCode.UNSET, "a client disconnect is not a gateway error"
+    breaker = await primary_cb.get_metrics()
+    assert (breaker["state"], breaker["half_open_successes"]) == ("HALF-OPEN", 0), "a disconnect is not a provider success"
+    assert breaker["recent_failures_count"] == 0, "a disconnect is not a provider failure"
+    spans.shutdown()
+
+    async with client.stream("POST", "/v1/chat/completions", json=payload, headers=auth) as replay:
+        assert replay.headers.get("X-Cache") == "MISS", "the partial answer is not cached"
