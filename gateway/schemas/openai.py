@@ -8,12 +8,22 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class TextContentPart(BaseModel):
+    """One `{"type": "text"}` entry of a message's list-form content."""
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["text"]
+    text: str
+
+
 class ChatMessage(BaseModel):
     """Individual message in a chat conversation."""
     model_config = ConfigDict(extra="allow")
 
     role: Literal["system", "user", "assistant", "function", "tool"] = "user"
-    content: str
+    # Null for an assistant turn that only carries tool_calls. Non-text parts (images, audio)
+    # stay rejected because the token estimator has no way to count them.
+    content: Optional[Union[str, List[TextContentPart]]]
     name: Optional[str] = None
 
 

@@ -39,7 +39,8 @@ class SemanticCache:
         # a hit is replayed in whichever shape the new request asks for.
         key_payload = request.model_dump(exclude={"stream", "user"})
         for message in key_payload["messages"]:
-            message["content"] = message["content"].strip()
+            if isinstance(message["content"], str):
+                message["content"] = message["content"].strip()
         serialized = json.dumps(key_payload, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 

@@ -38,7 +38,10 @@ def estimate_prompt_tokens(messages: Union[List[ChatMessage], List[dict]]) -> in
         num_tokens += 3  # Message framing overhead (<|im_start|>{role}...\n)
         if isinstance(message, ChatMessage):
             role = message.role or ""
-            content = message.content or ""
+            if isinstance(message.content, list):
+                content = "".join(part.text for part in message.content)
+            else:
+                content = message.content or ""
             name = message.name or ""
         elif isinstance(message, dict):
             role = message.get("role", "")
