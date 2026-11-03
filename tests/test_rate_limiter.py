@@ -129,6 +129,40 @@ async def test_gateway_413_when_prompt_exceeds_bucket_capacity(client):
     assert resp.json()["detail"]["error"]["type"] == "request_exceeds_token_capacity"
 
 
+LONG_TEXT = "Tell me about deep learning. " * 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"messages": [{"role": "user", "content": LONG_TEXT}]},
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "description": LONG_TEXT, "parameters": {"type": "object"}}}],
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": LONG_TEXT}}]},
+            ]
+        },
+    ],
+    ids=["in_content", "in_top_level_field", "in_message_field"],
+)
+async def test_forwarded_fields_count_toward_the_token_capacity(client, fields):
+    ctx = client._transport.app.state.ctx
+    ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"model": "llama3-8b", "stream": False, **fields},
+        headers={"Authorization": "Bearer test-key-forwarded-413"},
+    )
+
+    assert resp.status_code == 413, "text the upstream receives is budgeted wherever in the request it sits"
+
+
 @pytest.mark.asyncio
 async def test_non_streaming_request_charges_upstream_completion_tokens(client):
     ctx = client._transport.app.state.ctx
