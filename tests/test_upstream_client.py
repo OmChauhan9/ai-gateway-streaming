@@ -90,6 +90,15 @@ async def test_upstream_body_for_a_request_without_stream_adds_only_stream_false
     assert received == [{**sent, "stream": False}]
 
 
+@pytest.mark.asyncio
+async def test_message_without_role_reaches_the_upstream_as_a_user_message(test_settings):
+    sent = {"model": "gpt-4o", "messages": [{"content": "hi"}]}
+
+    received = await _bodies_received_by_upstream(test_settings, sent)
+
+    assert received[0]["messages"] == [{"role": "user", "content": "hi"}], "the default role is always forwarded"
+
+
 def _tool_loop_second_turn(stream: bool) -> dict:
     return {
         "model": "gpt-4o",
