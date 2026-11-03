@@ -1,7 +1,10 @@
 """Integration tests for Observability, Prometheus metrics, and OpenTelemetry instrumentation."""
 
+import asyncio
+import json
 import re
 
+import httpx
 import pytest
 
 from gateway.limiter.leaky_bucket import TokenLeakyBucketLimiter
@@ -78,6 +81,13 @@ def _provider_metric(metrics_text: str, name: str, provider: str):
     return float(match.group(1)) if match else None
 
 
+def _series_sum(metrics_text: str, metric: str, provider: str) -> float:
+    pattern = rf'^{metric}_sum\{{[^}}]*provider="{re.escape(provider)}"[^}}]*\}} (\S+)$'
+    match = re.search(pattern, metrics_text, re.MULTILINE)
+    assert match, f"{metric} has a series for {provider}"
+    return float(match.group(1))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
 async def test_breaker_metrics_count_one_trip_per_opening(test_settings, stream):
@@ -134,3 +144,47 @@ async def test_breaker_metrics_and_health_follow_the_cooldown(client):
     assert health["providers"]["mock-groq-primary"]["circuit"]["state"] == "HALF-OPEN", "/health reports the state after the cooldown"
     assert breakers["mock-groq-primary"]["circuit"]["state"] == "HALF-OPEN"
     await primary_cb.reset_manually()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_latency_after_failover_counts_from_gateway_ingress(test_settings, stream):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    primary_stall_s = 0.25
+    fallback = f"fallback-ingress-{'stream' if stream else 'nonstream'}"
+    settings = test_settings.model_copy(update={"fallback_provider_name": fallback, "cache_enabled": False})
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        if ":8001" in str(request.url):
+            await asyncio.sleep(primary_stall_s)
+            return httpx.Response(503, json={"error": {"message": "primary down"}})
+        if stream:
+            chunk = {"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]}
+            done = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            body = f"data: {json.dumps(chunk)}\n\ndata: {json.dumps(done)}\n\ndata: [DONE]\n\n"
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=body)
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "hi"}}]})
+
+    gateway = create_app(settings=settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    spans = InMemorySpanExporter()
+    gateway.state.ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "ingress clock"}], "stream": stream}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 200, resp.text
+        assert resp.headers.get("X-Gateway-Provider") == fallback
+        metrics_text = (await c.get("/metrics")).text
+
+    latency_s = _series_sum(metrics_text, "llm_gateway_latency_seconds", fallback)
+    assert latency_s >= primary_stall_s, "recorded latency includes the time spent on the failed primary"
+    if stream:
+        ttft_s = _series_sum(metrics_text, "llm_ttft_seconds", fallback)
+        assert ttft_s >= primary_stall_s, "recorded TTFT includes the time spent on the failed primary"
+        [span] = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+        assert span.attributes["gen_ai.server.ttft"] >= primary_stall_s * 1000, "span TTFT counts from ingress"
+    spans.shutdown()

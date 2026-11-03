@@ -66,8 +66,11 @@ async def test_streaming_cache_hit(client):
         {"presence_penalty": 1.0},
         {"frequency_penalty": 1.0},
         {"messages": [{"role": "user", "content": "Generation params cache prompt", "name": "alice"}]},
+        {"seed": 7},
+        {"tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]},
+        {"response_format": {"type": "json_object"}},
     ],
-    ids=["max_tokens", "stop", "n", "presence_penalty", "frequency_penalty", "message_name"],
+    ids=["max_tokens", "stop", "n", "presence_penalty", "frequency_penalty", "message_name", "seed", "tools", "response_format"],
 )
 async def test_cache_key_distinguishes_generation_params(client, variant):
     base = {
@@ -86,6 +89,91 @@ async def test_cache_key_distinguishes_generation_params(client, variant):
 
     resp3 = await client.post("/v1/chat/completions", json=base)
     assert resp3.headers.get("X-Cache") == "HIT", "an identical request still hits the cache"
+
+
+SHAPED_REPLY = {
+    "id": "x",
+    "object": "chat.completion",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}],
+            },
+            "logprobs": {"content": [{"token": "Let", "logprob": -0.1, "top_logprobs": []}]},
+            "finish_reason": "tool_calls",
+        },
+        {"index": 1, "message": {"role": "assistant", "content": "Second choice."}, "finish_reason": "stop"},
+    ],
+    "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+}
+SHAPED_STREAM = (
+    b'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+    b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}\n\n'
+    b"data: [DONE]\n\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stream, fields",
+    [
+        (False, {"tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]}),
+        (False, {"logprobs": True}),
+        (False, {"n": 2}),
+        (True, {"stream_options": {"include_usage": True}}),
+    ],
+    ids=["tools", "logprobs", "n", "stream_options"],
+)
+async def test_response_the_cache_cannot_replay_comes_from_the_upstream_every_time(test_settings, stream, fields):
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if stream:
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=SHAPED_STREAM)
+        return httpx.Response(200, json=SHAPED_REPLY)
+
+    app = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "weather?"}], "stream": stream, **fields}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post("/v1/chat/completions", json=payload)
+        second = await client.post("/v1/chat/completions", json=payload)
+
+    assert first.status_code == second.status_code == 200, second.text
+    assert second.headers.get("X-Cache") != "HIT", f"a text-only replay would drop what {sorted(fields)} shaped"
+    assert second.text == first.text, "the repeat gets the upstream's full response"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_key_distinguishes_tool_calls(client):
+    def tool_loop_turn(city: str) -> dict:
+        return {
+            "model": "llama3-8b",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "w", "arguments": f"{{\"city\": \"{city}\"}}"}}],
+                },
+                {"role": "tool", "content": "18C", "tool_call_id": "call_1"},
+            ],
+            "stream": False,
+        }
+
+    resp1 = await client.post("/v1/chat/completions", json=tool_loop_turn("Paris"))
+    assert resp1.status_code == 200, resp1.text
+
+    resp2 = await client.post("/v1/chat/completions", json=tool_loop_turn("Rome"))
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.headers.get("X-Cache") != "HIT", "a different tool call must not replay the cached response"
+
+    resp3 = await client.post("/v1/chat/completions", json=tool_loop_turn("Rome"))
+    assert resp3.headers.get("X-Cache") == "HIT", "an identical tool-loop turn still hits the cache"
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from typing import AsyncIterator, Awaitable, Callable, List, Optional
 from gateway.schemas.gateway_models import StreamTelemetryData
 from gateway.stream.error_frames import generate_sse_error_frame
 from gateway.stream.sse_parser import iter_sse_events
+from gateway.upstream.client import UpstreamConnectionError
 
 
 async def telemetry_stream_interceptor(
@@ -26,6 +27,7 @@ async def telemetry_stream_interceptor(
     fallback_used: bool = False,
     on_stream_complete: Optional[Callable[[StreamTelemetryData], Awaitable[None]]] = None,
     on_stream_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+    on_client_disconnect: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> AsyncIterator[bytes]:
     """Async generator interceptor profiling streaming LLM metrics in real time.
     
@@ -34,11 +36,13 @@ async def telemetry_stream_interceptor(
         request_id: Unique correlation ID
         provider_name: Selected upstream provider name
         model_name: Model identifier
-        t_start: Monotonic timestamp when upstream request was initiated
+        t_start: Monotonic timestamp when the gateway received the request
         prompt_tokens: Estimated prompt tokens
         fallback_used: Whether failover occurred
         on_stream_complete: Coroutine invoked with finalized telemetry data
         on_stream_error: Coroutine invoked if upstream drops mid-stream
+        on_client_disconnect: Coroutine invoked with the completion tokens streamed so far
+            if the client goes away mid-stream; the cancellation still propagates
     """
     t_first: Optional[float] = None
     t_last: Optional[float] = None
@@ -46,10 +50,12 @@ async def telemetry_stream_interceptor(
     inter_token_intervals: List[float] = []
     previous_token_time: Optional[float] = None
     accumulated_content: List[str] = []
+    finished = False
 
     try:
-        async for event, content in iter_sse_events(upstream_stream):
+        async for event, content, event_finished in iter_sse_events(upstream_stream):
             now = time.perf_counter()
+            finished = finished or event_finished
 
             if content:
                 token_count += 1
@@ -71,7 +77,10 @@ async def telemetry_stream_interceptor(
             # Forward only complete events, so an error frame never lands mid-event.
             yield event
 
-        # End of stream reached successfully
+        # `[DONE]` alone does not prove the answer is whole: vLLM, for one, sends it after an error event.
+        if not finished:
+            raise UpstreamConnectionError(provider_name, "stream ended before any choice carried a finish_reason")
+
         t_end = time.perf_counter()
         if t_first is None:
             # Fallback if no content tokens parsed (e.g. empty stream)
@@ -109,12 +118,14 @@ async def telemetry_stream_interceptor(
             cached=False,
         )
 
-        # Notify telemetry collectors (Prometheus / OpenTelemetry)
-        if on_stream_complete:
+    # CancelledError arrives while awaiting upstream bytes, GeneratorExit while parked at a yield.
+    except (asyncio.CancelledError, GeneratorExit):
+        if on_client_disconnect:
             try:
-                await on_stream_complete(telemetry)
+                await on_client_disconnect(token_count)
             except Exception:
-                pass  # Telemetry emission must not interrupt client streaming
+                pass
+        raise
 
     except Exception as exc:
         # Mid-stream connection drop or exception
@@ -132,3 +143,11 @@ async def telemetry_stream_interceptor(
             provider=provider_name,
         )
         yield error_frame
+        return
+
+    # Outside the try, so a disconnect while it runs cannot also report the stream as a 499.
+    if on_stream_complete:
+        try:
+            await on_stream_complete(telemetry)
+        except Exception:
+            pass  # Telemetry emission must not interrupt client streaming
