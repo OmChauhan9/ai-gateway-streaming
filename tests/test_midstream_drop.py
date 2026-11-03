@@ -326,3 +326,71 @@ async def test_client_disconnect_mid_stream_is_counted_and_reconciled(client, ga
 
     async with client.stream("POST", "/v1/chat/completions", json=payload, headers=auth) as replay:
         assert replay.headers.get("X-Cache") == "MISS", "the partial answer is not cached"
+
+
+@pytest.mark.asyncio
+async def test_cancel_inside_stream_complete_reports_no_second_outcome_and_propagates():
+    completing = asyncio.Event()
+    disconnects = []
+
+    async def suspending_complete(telemetry):
+        completing.set()
+        await asyncio.Event().wait()
+
+    async def on_disconnect(completion_tokens):
+        disconnects.append(completion_tokens)
+
+    async def upstream():
+        yield CONTENT_EVENT + FINISH_EVENT
+
+    async def consume():
+        async for _ in telemetry_stream_interceptor(
+            upstream_stream=upstream(),
+            request_id="test-one-outcome",
+            provider_name="groq",
+            model_name="llama3-8b",
+            t_start=time.perf_counter(),
+            on_stream_complete=suspending_complete,
+            on_client_disconnect=on_disconnect,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await completing.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert disconnects == [], "a stream already reported complete is not also reported as a disconnect"
+
+
+@pytest.mark.asyncio
+async def test_stream_outcome_callbacks_complete_inside_a_cancelled_scope(client, monkeypatch):
+    import anyio
+    import gateway.main
+    from gateway.schemas.gateway_models import StreamTelemetryData
+
+    callbacks = {}
+    real_interceptor = gateway.main.telemetry_stream_interceptor
+
+    def capturing_interceptor(**kwargs):
+        callbacks.update(kwargs)
+        return real_interceptor(**kwargs)
+
+    monkeypatch.setattr(gateway.main, "telemetry_stream_interceptor", capturing_interceptor)
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "Capture callbacks"}], "stream": True}
+    assert (await client.post("/v1/chat/completions", json=payload)).status_code == 200
+    telemetry = StreamTelemetryData(
+        request_id="test-cancelled-scope", provider="mock-groq-primary", model="llama3-8b",
+        ttft_ms=1.0, tpot_ms=1.0, total_latency_ms=1.0, completion_tokens=3, accumulated_text="abc",
+    )
+
+    for name, arg in [
+        ("on_stream_complete", telemetry),
+        ("on_stream_error", RuntimeError("upstream gone")),
+        ("on_client_disconnect", 3),
+    ]:
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await callbacks[name](arg)
+        assert not scope.cancelled_caught, f"{name} never suspends, so a client disconnect cannot cut it short"
