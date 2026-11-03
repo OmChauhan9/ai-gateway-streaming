@@ -406,6 +406,25 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     error=str(exc),
                 )
 
+            async def on_client_disconnect(completion_tokens: int):
+                # Says nothing about provider health, so the circuit breaker records no outcome.
+                ctx.metrics.record_request_metrics(
+                    provider=active_provider.name,
+                    model=payload.model,
+                    status="499",
+                    is_stream=True,
+                    ttft_ms=0.0,
+                    tpot_ms=0.0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
+                )
+                span.set_attribute("gen_ai.usage.completion_tokens", completion_tokens)
+                span.set_attribute("gateway.fallback_used", fallback_diverted)
+                span.set_attribute("gateway.client_disconnected", True)
+                span.end()
+                await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)
+
             # Upstream byte stream generator
             async def upstream_byte_iter() -> AsyncIterator[bytes]:
                 try:
@@ -424,6 +443,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 fallback_used=fallback_diverted,
                 on_stream_complete=on_stream_complete,
                 on_stream_error=on_stream_error,
+                on_client_disconnect=on_client_disconnect,
             )
 
             headers = {
