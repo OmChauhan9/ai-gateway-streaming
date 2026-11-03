@@ -12,21 +12,45 @@ from typing import AsyncIterator, Optional, Tuple
 _LINE_END = re.compile(rb"\r\n|\r|\n")
 
 
-def _delta_content(data: bytes) -> Optional[str]:
-    try:
-        content = json.loads(data)["choices"][0]["delta"]["content"]
-    except (ValueError, LookupError, TypeError):
+def _data_value(line: bytes) -> Optional[bytes]:
+    field, _, value = line.partition(b":")
+    if field != b"data":
         return None
-    return content if isinstance(content, str) and content else None
+    return value[1:] if value.startswith(b" ") else value
 
 
-async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[Tuple[bytes, Optional[str]]]:
+def _is_whole(data: bytes) -> bool:
+    if data == b"[DONE]":
+        return True
+    try:
+        json.loads(data)
+    except ValueError:
+        return False
+    return True
+
+
+def _first_choice(data: bytes) -> Tuple[Optional[str], bool]:
+    try:
+        choice = json.loads(data)["choices"][0]
+        finished = choice.get("finish_reason") is not None
+    except (ValueError, LookupError, TypeError, AttributeError):
+        return None, False
+    try:
+        content = choice["delta"]["content"]
+    except (LookupError, TypeError):
+        content = None
+    return (content if isinstance(content, str) and content else None), finished
+
+
+async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[Tuple[bytes, Optional[str], bool]]:
     """Regroup raw byte chunks into complete SSE events.
 
-    Yields `(raw_event, content)` for each event that a blank line terminates, where
-    `raw_event` is the event's exact upstream bytes and `content` is its non-empty
-    `choices[0].delta.content`, or None. Bytes left without a terminating blank line
-    at EOF are yielded as `(tail, None)`; if `chunks` raises, they are dropped.
+    Yields `(raw_event, content, finished)` for each event that a blank line terminates,
+    where `raw_event` is the event's exact upstream bytes, `content` is its non-empty
+    `choices[0].delta.content` or None, and `finished` is whether `choices[0]` carries a
+    `finish_reason`. When `chunks` ends, an event still missing its blank line is
+    yielded with the blank line appended if its data is whole JSON or `[DONE]`, and is
+    dropped as a cut-off fragment otherwise.
     """
     buf = b""
     pos = 0
@@ -45,12 +69,18 @@ async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[Tuple[b
             pos = match.end()
             pending_cr = match.group() == b"\r" and pos == len(buf)
             if line:
-                field, _, value = line.partition(b":")
-                if field == b"data":
-                    data_lines.append(value[1:] if value.startswith(b" ") else value)
+                if (value := _data_value(line)) is not None:
+                    data_lines.append(value)
                 continue
-            content = _delta_content(b"\n".join(data_lines)) if data_lines else None
-            yield buf[:pos], content
+            content, finished = _first_choice(b"\n".join(data_lines)) if data_lines else (None, False)
+            yield buf[:pos], content, finished
             buf, pos, data_lines = buf[pos:], 0, []
-    if buf:
-        yield buf, None
+    if pos < len(buf):
+        if (value := _data_value(buf[pos:])) is not None:
+            data_lines.append(value)
+        buf += b"\n"
+    data = b"\n".join(data_lines)
+    if data_lines and _is_whole(data):
+        content, finished = _first_choice(data)
+        # The appended blank line lets clients dispatch it and keeps a following error frame a separate event.
+        yield buf + (b"\r" if pending_cr else b"\n"), content, finished

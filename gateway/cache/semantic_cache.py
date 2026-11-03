@@ -23,6 +23,12 @@ class CacheEntry:
         return (now - self.created_at) > self.ttl
 
 
+def _replayable(request: ChatCompletionRequest) -> bool:
+    # A hit replays one choice of plain text. Unmodeled request fields (tools, logprobs,
+    # stream_options...) and n > 1 shape responses that replay cannot reproduce.
+    return not request.model_extra and request.n in (None, 1)
+
+
 class SemanticCache:
     """In-memory LRU-like TTL cache for LLM completions."""
 
@@ -39,7 +45,8 @@ class SemanticCache:
         # a hit is replayed in whichever shape the new request asks for.
         key_payload = request.model_dump(exclude={"stream", "user"})
         for message in key_payload["messages"]:
-            message["content"] = message["content"].strip()
+            if isinstance(message["content"], str):
+                message["content"] = message["content"].strip()
         serialized = json.dumps(key_payload, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -49,7 +56,7 @@ class SemanticCache:
         Returns:
             Optional[Tuple[str, dict]]: (response_text, usage_dict) if found and not expired.
         """
-        if not self.enabled:
+        if not self.enabled or not _replayable(request):
             return None
 
         key = self._generate_key(request)
@@ -71,7 +78,7 @@ class SemanticCache:
         usage: Optional[dict] = None,
     ) -> None:
         """Store completion in cache."""
-        if not self.enabled or self.max_size <= 0:
+        if not self.enabled or self.max_size <= 0 or not _replayable(request):
             return
 
         if len(self._store) >= self.max_size:

@@ -14,7 +14,8 @@ import json
 import time
 import uuid
 from typing import AsyncIterator, Optional
-from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response as PlainResponse, StreamingResponse
 
@@ -27,7 +28,7 @@ from gateway.circuit_breaker.provider_registry import (
 )
 from gateway.circuit_breaker.state_machine import CircuitState
 from gateway.limiter.leaky_bucket import RateLimitExceeded, RequestExceedsCapacity, TokenLeakyBucketLimiter
-from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
+from gateway.limiter.tokenizer_estimator import estimate_request_tokens, estimate_text_tokens
 from gateway.schemas.gateway_models import HealthResponse, StreamTelemetryData
 from gateway.schemas.openai import (
     ChatCompletionRequest,
@@ -126,6 +127,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     # Attach context to app state
     app.state.ctx = ctx
 
+    @app.exception_handler(HTTPException)
+    async def openai_error_body(request: Request, exc: HTTPException):
+        if isinstance(exc.detail, dict) and "error" in exc.detail:
+            return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=exc.headers)
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(UpstreamClientError)
     async def relay_upstream_client_error(request: Request, exc: UpstreamClientError):
         try:
@@ -142,6 +149,27 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             return authorization[7:].strip()
         client_host = request.client.host if request.client else "unknown_client"
         return client_host
+
+    async def _reject_non_finite_numbers(request: Request) -> None:
+        # Python's JSON parser accepts NaN, Infinity and 1e999, but no upstream does and the
+        # upstream encoder refuses them. As a dependency this runs before body validation,
+        # whose 422 would echo the value and fail to render.
+        try:
+            body = await request.json()
+        except ValueError:
+            return
+        try:
+            json.dumps(body, allow_nan=False)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": {
+                        "message": "Request body contains NaN or Infinity, which is not valid JSON.",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
 
     def _cannot_serve(last_exc: Optional[Exception], status_code: int, detail) -> HTTPException:
         # The gateway calls providers with its own key, so a 401/403 means the gateway is
@@ -170,8 +198,9 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if permit is None:
             message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
         else:
+            span.set_attribute("gen_ai.system", fallback.name)
             try:
-                return fallback, permit, *await send(fallback, payload)
+                return fallback, permit, await send(fallback, payload)
             except PROVIDER_FAILURES as fb_exc:
                 last_exc = fb_exc
                 permit.fail()
@@ -189,8 +218,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     # -------------------------------------------------------------------------
     # Core Endpoint: POST /v1/chat/completions
     # -------------------------------------------------------------------------
-    @app.post("/v1/chat/completions")
-    @app.post("/chat/completions")
+    @app.post("/v1/chat/completions", dependencies=[Depends(_reject_non_finite_numbers)])
+    @app.post("/chat/completions", dependencies=[Depends(_reject_non_finite_numbers)])
     async def chat_completions(
         payload: ChatCompletionRequest,
         request: Request,
@@ -201,7 +230,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         client_key = _extract_client_key(request, authorization)
 
         # 1. Ingress Validation & Leaky-Bucket Rate Limiting
-        prompt_tokens = estimate_prompt_tokens(payload.messages)
+        prompt_tokens = estimate_request_tokens(payload)
         if ctx.settings.rate_limiter_enabled:
             try:
                 await ctx.limiter.acquire(client_key, prompt_tokens)
@@ -292,13 +321,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
         # 4. Upstream Dispatch with Transparent Failover
         resp = None
-        t_upstream_start = time.perf_counter()
         active_provider = target_provider
         fallback_diverted = is_fallback
 
         if payload.stream:
             try:
-                resp, t_upstream_start = await ctx.client.send_streaming_request(active_provider, payload)
+                resp = await ctx.client.send_streaming_request(active_provider, payload)
             except PROVIDER_FAILURES as exc:
                 # Primary failed before headers committed! Trip circuit & failover
                 permit.fail()
@@ -310,7 +338,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
                 # Attempt transparent fallback if available
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    active_provider, permit, resp, t_upstream_start = await _fail_over(
+                    active_provider, permit, resp = await _fail_over(
                         ctx.client.send_streaming_request, payload, exc, span
                     )
                     fallback_diverted = True
@@ -321,7 +349,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     raise _cannot_serve(
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
-                        {"error": {"message": f"Upstream failure: {str(exc)}"}},
+                        {"error": {"message": f"Upstream failure: {str(exc)}", "type": "upstream_error"}},
                     )
             except BaseException:
                 permit.abandon()
@@ -387,6 +415,25 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     error=str(exc),
                 )
 
+            async def on_client_disconnect(completion_tokens: int):
+                # Says nothing about provider health, so the circuit breaker records no outcome.
+                ctx.metrics.record_request_metrics(
+                    provider=active_provider.name,
+                    model=payload.model,
+                    status="499",
+                    is_stream=True,
+                    ttft_ms=0.0,
+                    tpot_ms=0.0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
+                )
+                span.set_attribute("gen_ai.usage.completion_tokens", completion_tokens)
+                span.set_attribute("gateway.fallback_used", fallback_diverted)
+                span.set_attribute("gateway.client_disconnected", True)
+                span.end()
+                await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)
+
             # Upstream byte stream generator
             async def upstream_byte_iter() -> AsyncIterator[bytes]:
                 try:
@@ -400,11 +447,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 request_id=req_id,
                 provider_name=active_provider.name,
                 model_name=payload.model,
-                t_start=t_upstream_start,
+                t_start=req_start_time,
                 prompt_tokens=prompt_tokens,
                 fallback_used=fallback_diverted,
                 on_stream_complete=on_stream_complete,
                 on_stream_error=on_stream_error,
+                on_client_disconnect=on_client_disconnect,
             )
 
             async def settled_body() -> AsyncIterator[bytes]:
@@ -430,23 +478,26 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         else:
             # Non-streaming Request
             try:
-                data, t_upstream_start = await ctx.client.send_non_streaming_request(active_provider, payload)
+                data = await ctx.client.send_non_streaming_request(active_provider, payload)
             except PROVIDER_FAILURES as exc:
                 permit.fail()
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    active_provider, permit, data, t_upstream_start = await _fail_over(
+                    active_provider, permit, data = await _fail_over(
                         ctx.client.send_non_streaming_request, payload, exc, span
                     )
                     fallback_diverted = True
                 else:
-                    raise _cannot_serve(exc, 502, f"Upstream error: {str(exc)}")
+                    raise _cannot_serve(
+                        exc,
+                        status.HTTP_502_BAD_GATEWAY,
+                        {"error": {"message": f"Upstream error: {str(exc)}", "type": "upstream_error"}},
+                    )
             except BaseException:
                 permit.abandon()
                 raise
             permit.succeed()
 
-            now = time.perf_counter()
-            total_duration_ms = (now - t_upstream_start) * 1000.0
+            total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
             usage = data.get("usage", {})
             comp_tokens = usage.get("completion_tokens", 0)
 
