@@ -5,7 +5,7 @@ Faithful implementation of the standard OpenAI v1 REST specification.
 
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TextContentPart(BaseModel):
@@ -25,6 +25,13 @@ class ChatMessage(BaseModel):
     # stay rejected because the token estimator has no way to count them.
     content: Optional[Union[str, List[TextContentPart]]]
     name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _always_forward_role(self) -> "ChatMessage":
+        # The upstream dump keeps only fields the client set, but upstreams reject a
+        # message with no role, so the "user" default must still be sent.
+        self.model_fields_set.add("role")
+        return self
 
 
 class ChatCompletionRequest(BaseModel):
