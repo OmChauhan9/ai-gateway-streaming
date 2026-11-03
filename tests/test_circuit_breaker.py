@@ -141,6 +141,36 @@ async def test_abandoned_probe_frees_the_slot_without_a_verdict():
 
 
 @pytest.mark.asyncio
+async def test_listener_hears_each_state_change_once():
+    heard = []
+    cb = CircuitBreaker(
+        name="listened",
+        failure_threshold=3,
+        recovery_timeout_seconds=0.05,
+        on_transition=lambda name, old, new: heard.append((name, old, new)),
+    )
+    in_flight = [cb.try_acquire() for _ in range(10)]
+    for permit in in_flight:
+        permit.fail()
+    await asyncio.sleep(0.06)
+    assert (await cb.get_metrics())["state"] == "HALF-OPEN", "a status read reports the state after the cooldown"
+    cb.try_acquire().fail()
+    await cb.reset_manually()
+    await cb.trip_manually()
+    await cb.trip_manually()
+
+    S = CircuitState
+    assert heard == [
+        ("listened", None, S.CLOSED),
+        ("listened", S.CLOSED, S.OPEN),
+        ("listened", S.OPEN, S.HALF_OPEN),
+        ("listened", S.HALF_OPEN, S.OPEN),
+        ("listened", S.OPEN, S.CLOSED),
+        ("listened", S.CLOSED, S.OPEN),
+    ], "10 failures in flight open the breaker once, and a trip while OPEN is not a state change"
+
+
+@pytest.mark.asyncio
 async def test_unsettled_probe_is_reclaimed_after_its_lease():
     cb = CircuitBreaker(name="lease", recovery_timeout_seconds=0.05, probe_lease_seconds=0.1)
     await _half_open(cb)

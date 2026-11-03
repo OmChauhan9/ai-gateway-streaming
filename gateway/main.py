@@ -26,7 +26,6 @@ from gateway.circuit_breaker.provider_registry import (
     ProviderInfo,
     ProviderRegistry,
 )
-from gateway.circuit_breaker.state_machine import CircuitState
 from gateway.limiter.leaky_bucket import RateLimitExceeded, RequestExceedsCapacity, TokenLeakyBucketLimiter
 from gateway.limiter.tokenizer_estimator import estimate_request_tokens, estimate_text_tokens
 from gateway.schemas.gateway_models import HealthResponse, StreamTelemetryData
@@ -60,11 +59,13 @@ class GatewayContext:
     """Dependency container holding lifecycle singletons."""
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.metrics = get_metrics_registry()
         self.registry = ProviderRegistry(
             failure_threshold=settings.cb_failure_threshold,
             failure_window_seconds=settings.cb_failure_window_seconds,
             recovery_timeout_seconds=settings.cb_recovery_timeout_seconds,
             half_open_success_threshold=settings.cb_half_open_success_threshold,
+            on_transition=self.metrics.on_circuit_transition,
         )
         self.limiter = TokenLeakyBucketLimiter(
             capacity_tokens=settings.rate_limiter_capacity_tokens,
@@ -76,7 +77,6 @@ class GatewayContext:
             enabled=settings.cache_enabled,
         )
         self.otel = get_otel_manager(settings.otel_service_name)
-        self.metrics = get_metrics_registry()
         self.client = AsyncUpstreamClient()
 
 
@@ -330,11 +330,6 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             except PROVIDER_FAILURES as exc:
                 # Primary failed before headers committed! Trip circuit & failover
                 permit.fail()
-                ctx.metrics.set_circuit_state(
-                    active_provider.name, active_provider.circuit_breaker.state.value
-                )
-                if active_provider.circuit_breaker.state == CircuitState.OPEN:
-                    ctx.metrics.record_circuit_trip(active_provider.name)
 
                 # Attempt transparent fallback if available
                 if not fallback_diverted and ctx.registry.fallback_name:
@@ -361,9 +356,6 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             async def on_stream_complete(telemetry: StreamTelemetryData):
                 # Upstream succeeded!
                 permit.succeed()
-                ctx.metrics.set_circuit_state(
-                    active_provider.name, active_provider.circuit_breaker.state.value
-                )
 
                 # Prometheus metrics
                 ctx.metrics.record_request_metrics(
@@ -403,9 +395,6 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             async def on_stream_error(exc: Exception):
                 # Mid-stream error
                 permit.fail()
-                ctx.metrics.set_circuit_state(
-                    active_provider.name, active_provider.circuit_breaker.state.value
-                )
                 ctx.otel.record_completion_telemetry(
                     span=span,
                     ttft_ms=0,
@@ -543,6 +532,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     @app.get("/metrics")
     async def metrics():
         """Prometheus scrape endpoint."""
+        # Reading the breakers applies any cooldown that ran out since the last request, so the gauge is current.
+        await ctx.registry.get_all_status()
         body = ctx.metrics.scrape()
         return PlainResponse(content=body, media_type=CONTENT_TYPE_LATEST)
 
@@ -573,7 +564,6 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if not prov:
             raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
         await prov.circuit_breaker.trip_manually()
-        ctx.metrics.set_circuit_state(provider_name, "OPEN")
         return {"status": "tripped", "provider": provider_name, "state": "OPEN"}
 
     @app.post("/v1/circuit-breakers/{provider_name}/reset")
@@ -583,7 +573,6 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if not prov:
             raise HTTPException(status_code=404, detail=f"Provider '{provider_name}' not found")
         await prov.circuit_breaker.reset_manually()
-        ctx.metrics.set_circuit_state(provider_name, "CLOSED")
         return {"status": "reset", "provider": provider_name, "state": "CLOSED"}
 
     @app.get("/v1/rate-limiter/status")

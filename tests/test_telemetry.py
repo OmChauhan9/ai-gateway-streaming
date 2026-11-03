@@ -76,11 +76,74 @@ async def test_rate_limit_metric_counts_rejections_without_exposing_credentials(
     )
 
 
+def _provider_metric(metrics_text: str, name: str, provider: str):
+    match = re.search(rf'^{name}{{provider="{provider}"}} (\S+)$', metrics_text, re.MULTILINE)
+    return float(match.group(1)) if match else None
+
+
 def _series_sum(metrics_text: str, metric: str, provider: str) -> float:
     pattern = rf'^{metric}_sum\{{[^}}]*provider="{re.escape(provider)}"[^}}]*\}} (\S+)$'
     match = re.search(pattern, metrics_text, re.MULTILINE)
     assert match, f"{metric} has a series for {provider}"
     return float(match.group(1))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_breaker_metrics_count_one_trip_per_opening(test_settings, stream):
+    import asyncio
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        if ":8002" in str(request.url):
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+        await asyncio.sleep(0.1)
+        return httpx.Response(503, json={"error": {"message": "down"}})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker.recovery_timeout = 60.0
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        before = _provider_metric((await c.get("/metrics")).text, "circuit_breaker_trips_total", "mock-groq-primary") or 0.0
+        await asyncio.gather(*(
+            c.post("/v1/chat/completions", json={
+                "model": "llama3-8b",
+                "messages": [{"role": "user", "content": f"outage {i}"}],
+                "stream": stream,
+            })
+            for i in range(10)
+        ))
+        metrics_text = (await c.get("/metrics")).text
+
+    trips = _provider_metric(metrics_text, "circuit_breaker_trips_total", "mock-groq-primary") or 0.0
+    assert trips - before == 1, "10 failures in flight open the breaker once"
+    assert _provider_metric(metrics_text, "circuit_breaker_state", "mock-groq-primary") == 2.0, "gauge reads OPEN"
+
+
+@pytest.mark.asyncio
+async def test_breaker_metrics_and_health_follow_the_cooldown(client):
+    import asyncio
+
+    primary_cb = client._transport.app.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    before = _provider_metric((await client.get("/metrics")).text, "circuit_breaker_trips_total", "mock-groq-primary") or 0.0
+
+    await client.post("/v1/circuit-breakers/mock-groq-primary/trip")
+    metrics_text = (await client.get("/metrics")).text
+    trips = _provider_metric(metrics_text, "circuit_breaker_trips_total", "mock-groq-primary") or 0.0
+    assert trips - before == 1, "a manual trip counts"
+    assert _provider_metric(metrics_text, "circuit_breaker_state", "mock-groq-primary") == 2.0
+
+    await asyncio.sleep(primary_cb.recovery_timeout + 0.05)
+    metrics_text = (await client.get("/metrics")).text
+    health = (await client.get("/health")).json()
+    breakers = (await client.get("/v1/circuit-breakers")).json()
+
+    assert _provider_metric(metrics_text, "circuit_breaker_state", "mock-groq-primary") == 1.0, "gauge reads HALF-OPEN after the cooldown"
+    assert health["providers"]["mock-groq-primary"]["circuit"]["state"] == "HALF-OPEN", "/health reports the state after the cooldown"
+    assert breakers["mock-groq-primary"]["circuit"]["state"] == "HALF-OPEN"
+    await primary_cb.reset_manually()
 
 
 @pytest.mark.asyncio

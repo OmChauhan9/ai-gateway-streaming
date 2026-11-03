@@ -6,7 +6,7 @@ Coordinates transparent failover from Primary to Secondary providers.
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from gateway.circuit_breaker.state_machine import CircuitBreaker, Permit
+from gateway.circuit_breaker.state_machine import CircuitBreaker, Permit, TransitionListener
 
 
 class AllProvidersUnavailableException(Exception):
@@ -35,11 +35,13 @@ class ProviderRegistry:
         failure_window_seconds: float = 10.0,
         recovery_timeout_seconds: float = 15.0,
         half_open_success_threshold: int = 2,
+        on_transition: Optional[TransitionListener] = None,
     ):
         self.failure_threshold = failure_threshold
         self.failure_window = failure_window_seconds
         self.recovery_timeout = recovery_timeout_seconds
         self.half_open_success_threshold = half_open_success_threshold
+        self.on_transition = on_transition
 
         self._providers: Dict[str, ProviderInfo] = {}
         self.primary_name: Optional[str] = None
@@ -61,6 +63,7 @@ class ProviderRegistry:
             recovery_timeout_seconds=self.recovery_timeout,
             half_open_success_threshold=self.half_open_success_threshold,
             probe_lease_seconds=timeout_seconds,
+            on_transition=self.on_transition,
         )
         info = ProviderInfo(
             name=name,

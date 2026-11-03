@@ -18,6 +18,10 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
+from gateway.circuit_breaker.state_machine import CircuitState
+
+_CIRCUIT_STATE_VALUES = {CircuitState.CLOSED: 0.0, CircuitState.HALF_OPEN: 1.0, CircuitState.OPEN: 2.0}
+
 
 class PrometheusMetricsRegistry:
     """Manages all Prometheus metrics collected by the gateway."""
@@ -133,14 +137,15 @@ class PrometheusMetricsRegistry:
 
         self.gateway_latency_seconds.labels(provider=provider, status=status).observe(total_latency_ms / 1000.0)
 
-    def set_circuit_state(self, provider: str, state_str: str) -> None:
-        """Update circuit breaker gauge."""
-        mapping = {"CLOSED": 0.0, "HALF-OPEN": 1.0, "OPEN": 2.0}
-        val = mapping.get(state_str.upper(), 0.0)
-        self.circuit_state.labels(provider=provider).set(val)
+    def on_circuit_transition(self, provider: str, old: Optional[CircuitState], new: CircuitState) -> None:
+        """Circuit breaker listener, and the only writer of the circuit metrics.
 
-    def record_circuit_trip(self, provider: str) -> None:
-        self.circuit_trips_total.labels(provider=provider).inc()
+        `old` is None for the state a breaker starts in, which publishes both series at startup.
+        """
+        self.circuit_state.labels(provider=provider).set(_CIRCUIT_STATE_VALUES[new])
+        trips = self.circuit_trips_total.labels(provider=provider)
+        if new == CircuitState.OPEN:
+            trips.inc()
 
     def record_rate_limit(self) -> None:
         self.rate_limit_exceeded_total.inc()

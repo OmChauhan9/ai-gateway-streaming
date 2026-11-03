@@ -11,7 +11,7 @@ Only a permit from the current epoch, and in HALF-OPEN only the probe, can move 
 
 from enum import Enum
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 class CircuitState(str, Enum):
@@ -36,6 +36,9 @@ class CircuitBreakerOpenException(Exception):
             f"Circuit breaker for provider '{provider_name}' is OPEN. "
             f"Upstream failing. Fast-failing request. Cooldown remaining: {cooldown_remaining:.2f}s."
         )
+
+
+TransitionListener = Callable[[str, Optional[CircuitState], CircuitState], None]
 
 
 class Permit:
@@ -73,6 +76,7 @@ class CircuitBreaker:
         recovery_timeout_seconds: float = 15.0,
         half_open_success_threshold: int = 2,
         probe_lease_seconds: float = 30.0,
+        on_transition: Optional[TransitionListener] = None,
     ):
         self.name = name
         self.failure_threshold = failure_threshold
@@ -80,6 +84,7 @@ class CircuitBreaker:
         self.recovery_timeout = recovery_timeout_seconds
         self.half_open_success_threshold = half_open_success_threshold
         self.probe_lease = probe_lease_seconds
+        self._on_transition = on_transition
 
         self._state: CircuitState = CircuitState.CLOSED
         self._epoch: int = 0
@@ -89,6 +94,8 @@ class CircuitBreaker:
         self._probe_expires_at: float = 0.0
         self._last_state_change: float = time.monotonic()
         self._last_failure_timestamp: Optional[float] = None
+        if on_transition:
+            on_transition(name, None, self._state)
 
     @property
     def state(self) -> CircuitState:
@@ -102,9 +109,7 @@ class CircuitBreaker:
     def try_acquire(self) -> Optional[Permit]:
         """Admit one request to the upstream, or return None when the breaker refuses it."""
         now = time.monotonic()
-        if self._state == CircuitState.OPEN and now - self._last_state_change >= self.recovery_timeout:
-            self._transition(CircuitState.HALF_OPEN, now)
-
+        self._advance(now)
         if self._state == CircuitState.OPEN:
             return None
         if self._state == CircuitState.HALF_OPEN:
@@ -115,6 +120,11 @@ class CircuitBreaker:
             self._probe_expires_at = now + self.probe_lease
             return self._probe
         return Permit(self, self._epoch)
+
+    def _advance(self, now: float) -> None:
+        """Apply the time-driven OPEN to HALF-OPEN change, which happens lazily on the next admission or read."""
+        if self._state == CircuitState.OPEN and now - self._last_state_change >= self.recovery_timeout:
+            self._transition(CircuitState.HALF_OPEN, now)
 
     def _settle(self, permit: Permit, outcome: Outcome) -> None:
         if permit.outcome is not None:
@@ -143,7 +153,8 @@ class CircuitBreaker:
                 self._transition(CircuitState.OPEN, now)
 
     def _transition(self, new_state: CircuitState, now: float) -> None:
-        """Enter a state. The new epoch makes every permit issued before it stale."""
+        """Enter a state and tell the listener. The new epoch makes every permit issued before it stale."""
+        old_state = self._state
         self._state = new_state
         self._epoch += 1
         self._last_state_change = now
@@ -151,10 +162,13 @@ class CircuitBreaker:
         self._probe = None
         if new_state == CircuitState.CLOSED:
             self._failure_timestamps.clear()
+        if self._on_transition and new_state != old_state:
+            self._on_transition(self.name, old_state, new_state)
 
     async def get_metrics(self) -> Dict[str, any]:
         """Snapshot current circuit breaker status."""
         now = time.monotonic()
+        self._advance(now)
         self._clean_old_failures(now)
         elapsed = now - self._last_state_change
         cooldown_rem = max(0.0, self.recovery_timeout - elapsed) if self._state == CircuitState.OPEN else 0.0
