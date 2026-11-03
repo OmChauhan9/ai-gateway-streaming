@@ -14,7 +14,7 @@ import json
 import time
 import uuid
 from typing import AsyncIterator, Optional
-from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response as PlainResponse, StreamingResponse
@@ -28,7 +28,7 @@ from gateway.circuit_breaker.provider_registry import (
 )
 from gateway.circuit_breaker.state_machine import CircuitState
 from gateway.limiter.leaky_bucket import RateLimitExceeded, RequestExceedsCapacity, TokenLeakyBucketLimiter
-from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
+from gateway.limiter.tokenizer_estimator import estimate_request_tokens, estimate_text_tokens
 from gateway.schemas.gateway_models import HealthResponse, StreamTelemetryData
 from gateway.schemas.openai import (
     ChatCompletionRequest,
@@ -150,6 +150,27 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         client_host = request.client.host if request.client else "unknown_client"
         return client_host
 
+    async def _reject_non_finite_numbers(request: Request) -> None:
+        # Python's JSON parser accepts NaN, Infinity and 1e999, but no upstream does and the
+        # upstream encoder refuses them. As a dependency this runs before body validation,
+        # whose 422 would echo the value and fail to render.
+        try:
+            body = await request.json()
+        except ValueError:
+            return
+        try:
+            json.dumps(body, allow_nan=False)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": {
+                        "message": "Request body contains NaN or Infinity, which is not valid JSON.",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+
     def _cannot_serve(last_exc: Optional[Exception], status_code: int, detail) -> HTTPException:
         # The gateway calls providers with its own key, so a 401/403 means the gateway is
         # misconfigured, and the provider's body is not the caller's to see.
@@ -191,8 +212,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     # -------------------------------------------------------------------------
     # Core Endpoint: POST /v1/chat/completions
     # -------------------------------------------------------------------------
-    @app.post("/v1/chat/completions")
-    @app.post("/chat/completions")
+    @app.post("/v1/chat/completions", dependencies=[Depends(_reject_non_finite_numbers)])
+    @app.post("/chat/completions", dependencies=[Depends(_reject_non_finite_numbers)])
     async def chat_completions(
         payload: ChatCompletionRequest,
         request: Request,
@@ -203,7 +224,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         client_key = _extract_client_key(request, authorization)
 
         # 1. Ingress Validation & Leaky-Bucket Rate Limiting
-        prompt_tokens = estimate_prompt_tokens(payload.messages)
+        prompt_tokens = estimate_request_tokens(payload)
         if ctx.settings.rate_limiter_enabled:
             try:
                 await ctx.limiter.acquire(client_key, prompt_tokens)
