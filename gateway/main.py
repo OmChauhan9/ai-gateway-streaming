@@ -174,6 +174,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if not allowed:
             message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
         else:
+            span.set_attribute("gen_ai.system", fallback.name)
             try:
                 return fallback, *await send(fallback, payload)
             except PROVIDER_FAILURES as fb_exc:

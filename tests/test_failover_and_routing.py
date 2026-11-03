@@ -321,6 +321,33 @@ async def test_fallback_failure_after_primary_open_returns_openai_error_body(cli
     assert body["error"]["type"] == "upstream_error"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_span_after_failover_names_the_serving_provider(client, stream):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    gateway = client._transport.app
+    spans = InMemorySpanExporter()
+    gateway.state.ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    async with httpx_client_for(gateway.state.primary_mock_app) as adm:
+        await adm.post("/admin/fault-injection", json={"fail_with_status": 503})
+
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": f"Span provider after failover {stream}"}],
+        "stream": stream,
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
+    [span] = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    assert span.attributes["gen_ai.system"] == "mock-together-fallback", "span names the provider that served"
+    assert span.attributes["gateway.fallback_used"] is True
+    spans.shutdown()
+
+
 def httpx_client_for(app):
     """Helper to communicate with an in-memory FastAPI app directly."""
     import httpx
