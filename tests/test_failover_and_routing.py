@@ -301,6 +301,48 @@ async def test_nonstream_non_json_200_fails_over_to_fallback(test_settings):
     assert (await primary_cb.get_metrics())["recent_failures_count"] == 1, "malformed body counts as a primary failure"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_half_open_sends_one_probe_to_the_primary(test_settings, stream):
+    import asyncio
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    primary_hits = 0
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal primary_hits
+        if ":8002" not in str(request.url):
+            primary_hits += 1
+            await asyncio.sleep(0.2)
+            return httpx.Response(503, json={"error": {"message": "still down"}})
+        if stream:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\ndata: [DONE]\n\n',
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        await c.post("/v1/circuit-breakers/mock-groq-primary/trip")
+        await asyncio.sleep(test_settings.cb_recovery_timeout_seconds + 0.05)
+        responses = await asyncio.gather(*(
+            c.post("/v1/chat/completions", json={
+                "model": "llama3-8b",
+                "messages": [{"role": "user", "content": f"half-open {i}"}],
+                "stream": stream,
+            })
+            for i in range(20)
+        ))
+
+    assert [r.status_code for r in responses] == [200] * 20, "every request is served"
+    assert primary_hits == 1, "HALF-OPEN sends a single probe to the broken primary"
+
+
 def httpx_client_for(app):
     """Helper to communicate with an in-memory FastAPI app directly."""
     import httpx
