@@ -1,10 +1,13 @@
 """Tests for how the upstream client classifies provider responses."""
 
+import json
+
 import httpx
 import pytest
 
 from gateway.circuit_breaker.provider_registry import ProviderInfo
 from gateway.circuit_breaker.state_machine import CircuitBreaker
+from gateway.main import create_app
 from gateway.schemas.openai import ChatCompletionRequest
 from gateway.upstream.client import AsyncUpstreamClient, UpstreamServerError
 
@@ -31,3 +34,57 @@ async def test_5xx_whose_body_is_cut_off_is_still_a_server_error():
         assert info.value.status_code == 503, "classified by the status line, not the lost body"
     finally:
         await client.close()
+
+
+async def _bodies_received_by_upstream(settings, sent: dict) -> list:
+    received = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        received.append(json.loads(request.content))
+        if received[-1]["stream"]:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            )
+        return httpx.Response(200, json={"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]})
+
+    gateway = create_app(settings=settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=sent)
+    assert resp.status_code == 200, resp.text
+    return received
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_upstream_receives_exactly_the_fields_the_client_sent(test_settings, stream):
+    sent = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "tool", "content": "18C", "tool_call_id": "call_1"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+        "tool_choice": "auto",
+        "response_format": {"type": "json_object"},
+        "seed": 42,
+        "logprobs": True,
+        "temperature": 0.2,
+        "stream": stream,
+    }
+    if stream:
+        sent["stream_options"] = {"include_usage": True}
+
+    received = await _bodies_received_by_upstream(test_settings, sent)
+
+    assert received == [sent], "unmodeled fields forwarded unchanged, no defaults the client never set"
+
+
+@pytest.mark.asyncio
+async def test_upstream_body_for_a_request_without_stream_adds_only_stream_false(test_settings):
+    sent = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+    received = await _bodies_received_by_upstream(test_settings, sent)
+
+    assert received == [{**sent, "stream": False}]

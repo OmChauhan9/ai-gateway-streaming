@@ -66,8 +66,11 @@ async def test_streaming_cache_hit(client):
         {"presence_penalty": 1.0},
         {"frequency_penalty": 1.0},
         {"messages": [{"role": "user", "content": "Generation params cache prompt", "name": "alice"}]},
+        {"seed": 7},
+        {"tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]},
+        {"response_format": {"type": "json_object"}},
     ],
-    ids=["max_tokens", "stop", "n", "presence_penalty", "frequency_penalty", "message_name"],
+    ids=["max_tokens", "stop", "n", "presence_penalty", "frequency_penalty", "message_name", "seed", "tools", "response_format"],
 )
 async def test_cache_key_distinguishes_generation_params(client, variant):
     base = {
