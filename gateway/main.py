@@ -27,7 +27,7 @@ from gateway.circuit_breaker.provider_registry import (
 )
 from gateway.circuit_breaker.state_machine import CircuitState
 from gateway.limiter.leaky_bucket import RateLimitExceeded, RequestExceedsCapacity, TokenLeakyBucketLimiter
-from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
+from gateway.limiter.tokenizer_estimator import estimate_request_tokens, estimate_text_tokens
 from gateway.schemas.gateway_models import HealthResponse, StreamTelemetryData
 from gateway.schemas.openai import (
     ChatCompletionRequest,
@@ -216,7 +216,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         client_key = _extract_client_key(request, authorization)
 
         # 1. Ingress Validation & Leaky-Bucket Rate Limiting
-        prompt_tokens = estimate_prompt_tokens(payload.messages)
+        prompt_tokens = estimate_request_tokens(payload)
         if ctx.settings.rate_limiter_enabled:
             try:
                 await ctx.limiter.acquire(client_key, prompt_tokens)
