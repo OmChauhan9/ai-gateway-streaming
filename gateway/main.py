@@ -168,7 +168,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
         else:
             try:
-                return fallback, *await send(fallback, payload)
+                return fallback, await send(fallback, payload)
             except PROVIDER_FAILURES as fb_exc:
                 last_exc = fb_exc
                 await fallback.circuit_breaker.record_failure(fb_exc)
@@ -286,13 +286,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
         # 4. Upstream Dispatch with Transparent Failover
         resp = None
-        t_upstream_start = time.perf_counter()
         active_provider = target_provider
         fallback_diverted = is_fallback
 
         if payload.stream:
             try:
-                resp, t_upstream_start = await ctx.client.send_streaming_request(active_provider, payload)
+                resp = await ctx.client.send_streaming_request(active_provider, payload)
             except PROVIDER_FAILURES as exc:
                 # Primary failed before headers committed! Trip circuit & failover
                 await active_provider.circuit_breaker.record_failure(exc)
@@ -304,7 +303,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
                 # Attempt transparent fallback if available
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    active_provider, resp, t_upstream_start = await _fail_over(
+                    active_provider, resp = await _fail_over(
                         ctx.client.send_streaming_request, payload, exc, span
                     )
                     fallback_diverted = True
@@ -391,7 +390,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 request_id=req_id,
                 provider_name=active_provider.name,
                 model_name=payload.model,
-                t_start=t_upstream_start,
+                t_start=req_start_time,
                 prompt_tokens=prompt_tokens,
                 fallback_used=fallback_diverted,
                 on_stream_complete=on_stream_complete,
@@ -413,19 +412,18 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         else:
             # Non-streaming Request
             try:
-                data, t_upstream_start = await ctx.client.send_non_streaming_request(active_provider, payload)
+                data = await ctx.client.send_non_streaming_request(active_provider, payload)
             except PROVIDER_FAILURES as exc:
                 await active_provider.circuit_breaker.record_failure(exc)
                 if not fallback_diverted and ctx.registry.fallback_name:
-                    active_provider, data, t_upstream_start = await _fail_over(
+                    active_provider, data = await _fail_over(
                         ctx.client.send_non_streaming_request, payload, exc, span
                     )
                     fallback_diverted = True
                 else:
                     raise _cannot_serve(exc, 502, f"Upstream error: {str(exc)}")
 
-            now = time.perf_counter()
-            total_duration_ms = (now - t_upstream_start) * 1000.0
+            total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
             usage = data.get("usage", {})
             comp_tokens = usage.get("completion_tokens", 0)
 
