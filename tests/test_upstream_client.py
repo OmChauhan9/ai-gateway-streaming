@@ -145,6 +145,11 @@ NON_FINITE_BODIES = {
     "nested": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"metadata":{"w":[1,-Infinity]},"stream":%s}',
     "modeled_field": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"temperature":NaN,"stream":%s}',
     "overflowing_literal": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"seed":1e999,"stream":%s}',
+    "text_part": '{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"text","text":"x","w":NaN}]}],"stream":%s}',
+    "tool_calls": (
+        '{"model":"gpt-4o","messages":[{"role":"user","content":"x"},{"role":"assistant","content":null,'
+        '"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"},"w":Infinity}]}],"stream":%s}'
+    ),
 }
 
 

@@ -169,8 +169,15 @@ LONG_TEXT = "Tell me about deep learning. " * 30
                 {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": LONG_TEXT}}]},
             ]
         },
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": LONG_TEXT}}]},
+            ]
+        },
+        {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "annotation": LONG_TEXT}]}]},
     ],
-    ids=["in_content", "in_top_level_field", "in_message_field"],
+    ids=["in_content", "in_top_level_field", "in_message_field", "in_null_content_tool_calls", "in_text_part_field"],
 )
 async def test_forwarded_fields_count_toward_the_token_capacity(client, fields):
     ctx = client._transport.app.state.ctx
