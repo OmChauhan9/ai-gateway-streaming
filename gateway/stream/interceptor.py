@@ -27,6 +27,7 @@ async def telemetry_stream_interceptor(
     fallback_used: bool = False,
     on_stream_complete: Optional[Callable[[StreamTelemetryData], Awaitable[None]]] = None,
     on_stream_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+    on_client_disconnect: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> AsyncIterator[bytes]:
     """Async generator interceptor profiling streaming LLM metrics in real time.
     
@@ -40,6 +41,8 @@ async def telemetry_stream_interceptor(
         fallback_used: Whether failover occurred
         on_stream_complete: Coroutine invoked with finalized telemetry data
         on_stream_error: Coroutine invoked if upstream drops mid-stream
+        on_client_disconnect: Coroutine invoked with the completion tokens streamed so far
+            if the client goes away mid-stream; the cancellation still propagates
     """
     t_first: Optional[float] = None
     t_last: Optional[float] = None
@@ -121,6 +124,15 @@ async def telemetry_stream_interceptor(
                 await on_stream_complete(telemetry)
             except Exception:
                 pass  # Telemetry emission must not interrupt client streaming
+
+    # CancelledError arrives while awaiting upstream bytes, GeneratorExit while parked at a yield.
+    except (asyncio.CancelledError, GeneratorExit):
+        if on_client_disconnect:
+            try:
+                await on_client_disconnect(token_count)
+            except Exception:
+                pass
+        raise
 
     except Exception as exc:
         # Mid-stream connection drop or exception
