@@ -108,7 +108,9 @@ async def test_gateway_429_endpoint_rejection(client):
     resp = await client.post("/v1/chat/completions", json=payload, headers=headers)
     assert resp.status_code == 429
     assert "Retry-After" in resp.headers
-    assert resp.json()["detail"]["error"]["type"] == "tokens_per_second_exceeded"
+    error = resp.json()["error"]
+    assert error["type"] == "tokens_per_second_exceeded"
+    assert error["retry_after_seconds"] > 0, "the wait hint stays in the OpenAI-shaped body"
 
 
 @pytest.mark.asyncio
@@ -126,7 +128,7 @@ async def test_gateway_413_when_prompt_exceeds_bucket_capacity(client):
     )
     assert resp.status_code == 413, "a prompt larger than capacity can never be admitted"
     assert "Retry-After" not in resp.headers, "waiting cannot help, so no Retry-After"
-    assert resp.json()["detail"]["error"]["type"] == "request_exceeds_token_capacity"
+    assert resp.json()["error"]["type"] == "request_exceeds_token_capacity"
 
 
 LONG_TEXT = "Tell me about deep learning. " * 30
