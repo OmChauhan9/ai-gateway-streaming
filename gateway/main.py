@@ -389,7 +389,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     tpot_ms=0.0,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
-                    total_latency_ms=(time.perf_counter() - t_upstream_start) * 1000.0,
+                    total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
                 )
                 span.set_attribute("gen_ai.usage.completion_tokens", completion_tokens)
                 span.set_attribute("gateway.fallback_used", fallback_diverted)
