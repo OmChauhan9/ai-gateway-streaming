@@ -147,11 +147,31 @@ async def test_stream_with_finish_reason_completes_without_done():
 @pytest.mark.parametrize(
     "ending, forwarded",
     [
+        (FINISH_EVENT[:-1], CONTENT_EVENT + FINISH_EVENT),
+        (FINISH_EVENT[:-2], CONTENT_EVENT + FINISH_EVENT),
+        (FINISH_EVENT + b"data: [DONE]\n", CONTENT_EVENT + FINISH_EVENT + b"data: [DONE]\n\n"),
+    ],
+    ids=["finish-single-newline", "finish-no-newline", "done-single-newline"],
+)
+async def test_whole_final_event_without_blank_line_is_dispatched(ending, forwarded):
+    output, completed, errors = await _intercept_ending(ending)
+
+    assert output == forwarded, "the final event reaches the client as a terminated event"
+    assert len(completed) == 1 and not errors, "its finish_reason marks the stream complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ending, forwarded",
+    [
         (b"", CONTENT_EVENT),
         (b"data: [DONE]\n\n", CONTENT_EVENT + b"data: [DONE]\n\n"),
+        (b"data: [DONE]\n", CONTENT_EVENT + b"data: [DONE]\n\n"),
         (b'data: {"choices": [{"delta": {"conte', CONTENT_EVENT),
+        (b'data: {"choices": [{"delta": {"conte\n', CONTENT_EVENT),
     ],
-    ids=["eof-after-content", "done-without-finish-reason", "eof-mid-event"],
+    ids=["eof-after-content", "done-without-finish-reason", "unterminated-done-without-finish-reason",
+         "eof-mid-event", "eof-mid-event-after-newline"],
 )
 async def test_stream_that_ends_without_finish_reason_is_a_midstream_failure(ending, forwarded):
     output, completed, errors = await _intercept_ending(ending)
