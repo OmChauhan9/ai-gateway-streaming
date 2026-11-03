@@ -44,6 +44,7 @@ def estimate_prompt_tokens(messages: Union[List[ChatMessage], List[dict]]) -> in
             role = message.role or ""
             if isinstance(message.content, list):
                 content = "".join(part.text for part in message.content)
+                num_tokens += sum(_forwarded_field_tokens(part) for part in message.content)
             else:
                 content = message.content or ""
             name = message.name or ""
