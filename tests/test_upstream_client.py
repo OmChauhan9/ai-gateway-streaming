@@ -88,3 +88,43 @@ async def test_upstream_body_for_a_request_without_stream_adds_only_stream_false
     received = await _bodies_received_by_upstream(test_settings, sent)
 
     assert received == [{**sent, "stream": False}]
+
+
+def _tool_loop_second_turn(stream: bool) -> dict:
+    return {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}],
+            },
+            {"role": "tool", "content": "18C", "tool_call_id": "call_1"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+        "stream": stream,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_tool_loop_second_turn_reaches_the_upstream_unchanged(test_settings, stream):
+    sent = _tool_loop_second_turn(stream)
+
+    received = await _bodies_received_by_upstream(test_settings, sent)
+
+    assert received == [sent], "the assistant's content: null and tool_calls reach the upstream as sent"
+
+
+@pytest.mark.asyncio
+async def test_text_part_content_reaches_the_upstream_unchanged(test_settings):
+    sent = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "text", "text": "there"}]}],
+        "stream": False,
+    }
+
+    received = await _bodies_received_by_upstream(test_settings, sent)
+
+    assert received == [sent], "list-of-text-parts content is forwarded as sent"

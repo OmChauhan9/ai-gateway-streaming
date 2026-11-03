@@ -26,6 +26,23 @@ def test_token_estimation():
     assert 8 <= prompt_tokens <= 18
 
 
+def test_token_estimate_for_a_null_content_tool_call_message_is_small_and_positive():
+    message = ChatMessage(
+        role="assistant",
+        content=None,
+        tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "w", "arguments": "{}"}}],
+    )
+
+    assert 0 < estimate_prompt_tokens([message]) < 20
+
+
+def test_text_parts_are_estimated_like_the_same_text_as_a_string():
+    as_parts = ChatMessage(role="user", content=[{"type": "text", "text": "What is the speed of light?"}])
+    as_string = ChatMessage(role="user", content="What is the speed of light?")
+
+    assert estimate_prompt_tokens([as_parts]) == estimate_prompt_tokens([as_string])
+
+
 @pytest.mark.asyncio
 async def test_leaky_bucket_basic_acquire():
     limiter = TokenLeakyBucketLimiter(capacity_tokens=500, leak_rate_tokens_per_second=100.0)
