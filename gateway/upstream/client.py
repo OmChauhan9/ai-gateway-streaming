@@ -4,8 +4,7 @@ Configured with high-performance connection pooling, keep-alives, and timeouts.
 Dispatches requests to upstream endpoints and normalizes network/protocol errors.
 """
 
-import time
-from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 from gateway.circuit_breaker.provider_registry import ProviderInfo
 from gateway.schemas.openai import ChatCompletionRequest
@@ -86,12 +85,8 @@ class AsyncUpstreamClient:
         self,
         provider: ProviderInfo,
         request: ChatCompletionRequest,
-    ) -> Tuple[httpx.Response, float]:
-        """Initiate upstream streaming connection.
-        
-        Returns:
-            Tuple[httpx.Response, float]: (open_streaming_response, t_start_monotonic)
-        """
+    ) -> httpx.Response:
+        """Initiate upstream streaming connection and return the open streaming response."""
         url = f"{provider.base_url}/chat/completions"
         headers = self._prepare_headers(provider)
         payload = request.model_dump(exclude_unset=True)
@@ -103,7 +98,6 @@ class AsyncUpstreamClient:
             connect=5.0,
         )
 
-        t_start = time.perf_counter()
         req = self.client.build_request(
             "POST",
             url,
@@ -140,13 +134,13 @@ class AsyncUpstreamClient:
             else:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
-        return resp, t_start
+        return resp
 
     async def send_non_streaming_request(
         self,
         provider: ProviderInfo,
         request: ChatCompletionRequest,
-    ) -> Tuple[dict, float]:
+    ) -> dict:
         """Dispatch non-streaming completion call."""
         url = f"{provider.base_url}/chat/completions"
         headers = self._prepare_headers(provider)
@@ -154,7 +148,6 @@ class AsyncUpstreamClient:
         payload["stream"] = False
 
         timeout = httpx.Timeout(timeout=provider.timeout_seconds, connect=5.0)
-        t_start = time.perf_counter()
 
         try:
             resp = await self.client.post(url, json=payload, headers=headers, timeout=timeout)
@@ -177,6 +170,6 @@ class AsyncUpstreamClient:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
         try:
-            return resp.json(), t_start
+            return resp.json()
         except ValueError as exc:
             raise UpstreamServerError(provider.name, resp.status_code, f"Malformed JSON body: {exc}") from exc

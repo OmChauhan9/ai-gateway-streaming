@@ -174,6 +174,6 @@ async def test_non_finite_number_is_a_client_error_with_no_upstream_call(test_se
         breakers = (await c.get("/v1/circuit-breakers")).json()
 
     assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"]["error"]["type"] == "invalid_request_error"
+    assert resp.json()["error"]["type"] == "invalid_request_error"
     assert calls == [], "a body no upstream can accept is not sent"
     assert all(b["circuit"]["recent_failures_count"] == 0 for b in breakers.values()), "no provider is charged for it"
