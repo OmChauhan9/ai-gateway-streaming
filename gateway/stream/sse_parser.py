@@ -12,21 +12,27 @@ from typing import AsyncIterator, Optional, Tuple
 _LINE_END = re.compile(rb"\r\n|\r|\n")
 
 
-def _delta_content(data: bytes) -> Optional[str]:
+def _first_choice(data: bytes) -> Tuple[Optional[str], bool]:
     try:
-        content = json.loads(data)["choices"][0]["delta"]["content"]
-    except (ValueError, LookupError, TypeError):
-        return None
-    return content if isinstance(content, str) and content else None
+        choice = json.loads(data)["choices"][0]
+        finished = choice.get("finish_reason") is not None
+    except (ValueError, LookupError, TypeError, AttributeError):
+        return None, False
+    try:
+        content = choice["delta"]["content"]
+    except (LookupError, TypeError):
+        content = None
+    return (content if isinstance(content, str) and content else None), finished
 
 
-async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[Tuple[bytes, Optional[str]]]:
+async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[Tuple[bytes, Optional[str], bool]]:
     """Regroup raw byte chunks into complete SSE events.
 
-    Yields `(raw_event, content)` for each event that a blank line terminates, where
-    `raw_event` is the event's exact upstream bytes and `content` is its non-empty
-    `choices[0].delta.content`, or None. Bytes left without a terminating blank line
-    at EOF are yielded as `(tail, None)`; if `chunks` raises, they are dropped.
+    Yields `(raw_event, content, finished)` for each event that a blank line terminates,
+    where `raw_event` is the event's exact upstream bytes, `content` is its non-empty
+    `choices[0].delta.content` or None, and `finished` is whether `choices[0]` carries a
+    `finish_reason`. Bytes left without a terminating blank line when `chunks` ends are
+    an incomplete event and are dropped.
     """
     buf = b""
     pos = 0
@@ -49,8 +55,6 @@ async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[Tuple[b
                 if field == b"data":
                     data_lines.append(value[1:] if value.startswith(b" ") else value)
                 continue
-            content = _delta_content(b"\n".join(data_lines)) if data_lines else None
-            yield buf[:pos], content
+            content, finished = _first_choice(b"\n".join(data_lines)) if data_lines else (None, False)
+            yield buf[:pos], content, finished
             buf, pos, data_lines = buf[pos:], 0, []
-    if buf:
-        yield buf, None

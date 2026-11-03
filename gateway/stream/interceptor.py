@@ -14,6 +14,7 @@ from typing import AsyncIterator, Awaitable, Callable, List, Optional
 from gateway.schemas.gateway_models import StreamTelemetryData
 from gateway.stream.error_frames import generate_sse_error_frame
 from gateway.stream.sse_parser import iter_sse_events
+from gateway.upstream.client import UpstreamConnectionError
 
 
 async def telemetry_stream_interceptor(
@@ -46,10 +47,12 @@ async def telemetry_stream_interceptor(
     inter_token_intervals: List[float] = []
     previous_token_time: Optional[float] = None
     accumulated_content: List[str] = []
+    finished = False
 
     try:
-        async for event, content in iter_sse_events(upstream_stream):
+        async for event, content, event_finished in iter_sse_events(upstream_stream):
             now = time.perf_counter()
+            finished = finished or event_finished
 
             if content:
                 token_count += 1
@@ -71,7 +74,10 @@ async def telemetry_stream_interceptor(
             # Forward only complete events, so an error frame never lands mid-event.
             yield event
 
-        # End of stream reached successfully
+        # `[DONE]` alone does not prove the answer is whole: vLLM, for one, sends it after an error event.
+        if not finished:
+            raise UpstreamConnectionError(provider_name, "stream ended before any choice carried a finish_reason")
+
         t_end = time.perf_counter()
         if t_first is None:
             # Fallback if no content tokens parsed (e.g. empty stream)
