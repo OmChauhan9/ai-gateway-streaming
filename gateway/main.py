@@ -45,11 +45,14 @@ from gateway.telemetry.prometheus import (
 )
 from gateway.upstream.client import (
     AsyncUpstreamClient,
+    UpstreamAuthError,
     UpstreamClientError,
     UpstreamConnectionError,
     UpstreamRateLimitedError,
     UpstreamServerError,
 )
+
+PROVIDER_FAILURES = (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError, UpstreamAuthError)
 
 
 class GatewayContext:
@@ -140,22 +143,41 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         client_host = request.client.host if request.client else "unknown_client"
         return client_host
 
+    def _cannot_serve(last_exc: Optional[Exception], status_code: int, detail) -> HTTPException:
+        # The gateway calls providers with its own key, so a 401/403 means the gateway is
+        # misconfigured, and the provider's body is not the caller's to see.
+        if isinstance(last_exc, UpstreamAuthError):
+            status_code = status.HTTP_502_BAD_GATEWAY
+            detail = {
+                "error": {
+                    "message": (
+                        f"Provider '{last_exc.provider}' rejected the gateway's provider credentials "
+                        f"(HTTP {last_exc.status_code})."
+                    ),
+                    "type": "upstream_auth_failed",
+                }
+            }
+        return HTTPException(status_code=status_code, detail=detail)
+
     async def _fail_over(send, payload: ChatCompletionRequest, primary_exc: Exception, span):
-        """After the primary failed, serve from the fallback or raise a 503."""
+        """After the primary failed, serve from the fallback or raise a 503 (502 on a provider auth rejection)."""
         fallback = ctx.registry.get_provider(ctx.registry.fallback_name)
         allowed, _, _ = await fallback.circuit_breaker.can_execute()
+        last_exc = primary_exc
         if not allowed:
             message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
         else:
             try:
                 return fallback, *await send(fallback, payload)
-            except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as fb_exc:
+            except PROVIDER_FAILURES as fb_exc:
+                last_exc = fb_exc
                 await fallback.circuit_breaker.record_failure(fb_exc)
                 message = f"Both primary and fallback failed: {fb_exc}"
         ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=allowed, error=message)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error": {"message": message, "type": "all_providers_unavailable"}},
+        raise _cannot_serve(
+            last_exc,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            {"error": {"message": message, "type": "all_providers_unavailable"}},
         )
 
     # -------------------------------------------------------------------------
@@ -271,7 +293,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if payload.stream:
             try:
                 resp, t_upstream_start = await ctx.client.send_streaming_request(active_provider, payload)
-            except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as exc:
+            except PROVIDER_FAILURES as exc:
                 # Primary failed before headers committed! Trip circuit & failover
                 await active_provider.circuit_breaker.record_failure(exc)
                 ctx.metrics.set_circuit_state(
@@ -290,9 +312,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     ctx.otel.record_completion_telemetry(
                         span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
                     )
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail={"error": {"message": f"Upstream failure: {str(exc)}"}},
+                    raise _cannot_serve(
+                        exc,
+                        status.HTTP_502_BAD_GATEWAY,
+                        {"error": {"message": f"Upstream failure: {str(exc)}"}},
                     )
 
             # 5. Non-Blocking SSE Streaming Interceptor
@@ -391,7 +414,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             # Non-streaming Request
             try:
                 data, t_upstream_start = await ctx.client.send_non_streaming_request(active_provider, payload)
-            except (UpstreamConnectionError, UpstreamServerError, UpstreamRateLimitedError) as exc:
+            except PROVIDER_FAILURES as exc:
                 await active_provider.circuit_breaker.record_failure(exc)
                 if not fallback_diverted and ctx.registry.fallback_name:
                     active_provider, data, t_upstream_start = await _fail_over(
@@ -399,7 +422,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     )
                     fallback_diverted = True
                 else:
-                    raise HTTPException(status_code=502, detail=f"Upstream error: {str(exc)}")
+                    raise _cannot_serve(exc, 502, f"Upstream error: {str(exc)}")
 
             now = time.perf_counter()
             total_duration_ms = (now - t_upstream_start) * 1000.0
