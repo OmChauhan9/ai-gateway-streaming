@@ -321,7 +321,7 @@ async def test_half_open_sends_one_probe_to_the_primary(test_settings, stream):
             return httpx.Response(
                 200,
                 headers={"Content-Type": "text/event-stream"},
-                content=b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\ndata: [DONE]\n\n',
+                content=b'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n',
             )
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
 
