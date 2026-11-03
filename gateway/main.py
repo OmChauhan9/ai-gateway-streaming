@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import AsyncIterator, Optional
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response as PlainResponse, StreamingResponse
 
@@ -126,6 +127,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
     # Attach context to app state
     app.state.ctx = ctx
 
+    @app.exception_handler(HTTPException)
+    async def openai_error_body(request: Request, exc: HTTPException):
+        if isinstance(exc.detail, dict) and "error" in exc.detail:
+            return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=exc.headers)
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(UpstreamClientError)
     async def relay_upstream_client_error(request: Request, exc: UpstreamClientError):
         try:
@@ -167,6 +174,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         if not allowed:
             message = f"Primary failed and fallback circuit is OPEN: {primary_exc}"
         else:
+            span.set_attribute("gen_ai.system", fallback.name)
             try:
                 return fallback, await send(fallback, payload)
             except PROVIDER_FAILURES as fb_exc:
@@ -314,7 +322,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     raise _cannot_serve(
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
-                        {"error": {"message": f"Upstream failure: {str(exc)}"}},
+                        {"error": {"message": f"Upstream failure: {str(exc)}", "type": "upstream_error"}},
                     )
 
             # 5. Non-Blocking SSE Streaming Interceptor
@@ -421,7 +429,11 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     )
                     fallback_diverted = True
                 else:
-                    raise _cannot_serve(exc, 502, f"Upstream error: {str(exc)}")
+                    raise _cannot_serve(
+                        exc,
+                        status.HTTP_502_BAD_GATEWAY,
+                        {"error": {"message": f"Upstream error: {str(exc)}", "type": "upstream_error"}},
+                    )
 
             total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
             usage = data.get("usage", {})
