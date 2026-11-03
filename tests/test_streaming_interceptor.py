@@ -8,23 +8,26 @@ from gateway.schemas.gateway_models import StreamTelemetryData
 from gateway.stream.interceptor import telemetry_stream_interceptor
 from gateway.stream.sse_parser import iter_sse_events
 
+FINISH_EVENT = b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
 
 @pytest.mark.parametrize(
-    "event, expected",
+    "event, content, finished",
     [
-        (b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n', None),
-        (b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n', "Hello"),
-        (b'data: {"choices": [{"delta": {"content": " world!"}}]}\n\n', " world!"),
-        (b'data: {"choices": [{"delta": {"content": "He said \\"hi\\""}}]}\n\n', 'He said "hi"'),
-        (b"data: [DONE]\n\n", None),
+        (b'data: {"choices": [{"delta": {"role": "assistant"}, "finish_reason": null}]}\n\n', None, False),
+        (b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n', "Hello", False),
+        (b'data: {"choices": [{"delta": {"content": " world!"}}]}\n\n', " world!", False),
+        (b'data: {"choices": [{"delta": {"content": "He said \\"hi\\""}}]}\n\n', 'He said "hi"', False),
+        (FINISH_EVENT, None, True),
+        (b'data: {"choices": [{"delta": {"content": "."}, "finish_reason": "length"}]}\n\n', ".", True),
+        (b"data: [DONE]\n\n", None, False),
     ],
-    ids=["role", "token", "leading-space", "escaped-quotes", "done"],
+    ids=["role", "token", "leading-space", "escaped-quotes", "finish", "content-and-finish", "done"],
 )
-async def test_iter_sse_events_extracts_delta_content(event, expected):
+async def test_iter_sse_events_extracts_content_and_finish(event, content, finished):
     async def upstream():
         yield event
 
-    assert [item async for item in iter_sse_events(upstream())] == [(event, expected)]
+    assert [item async for item in iter_sse_events(upstream())] == [(event, content, finished)]
 
 
 @pytest.mark.asyncio
@@ -41,6 +44,7 @@ async def test_telemetry_stream_interceptor_profiling():
             chunk_dict = {"choices": [{"delta": {"content": f" Token{i}"}}]}
             yield f"data: {json.dumps(chunk_dict)}\n\n".encode("utf-8")
 
+        yield FINISH_EVENT
         yield b"data: [DONE]\n\n"
 
     collected_telemetry = None
@@ -64,7 +68,7 @@ async def test_telemetry_stream_interceptor_profiling():
         chunks_received.append(chunk)
 
     # 1. Verify chunks were yielded without drops
-    assert len(chunks_received) == 6  # 5 tokens + 1 [DONE]
+    assert len(chunks_received) == 7  # 5 tokens + finish + [DONE]
 
     # 2. Verify telemetry accuracy
     assert collected_telemetry is not None
@@ -117,6 +121,7 @@ async def test_events_coalesced_into_one_chunk_are_each_counted():
         b'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n'
         + _delta_event("Hello")
         + _delta_event(" world")
+        + FINISH_EVENT
         + b"data: [DONE]\n\n"
     )
     forwarded, telemetry = await _intercept([(0, chunk)])
@@ -128,9 +133,9 @@ async def test_events_coalesced_into_one_chunk_are_each_counted():
 async def test_event_split_across_chunks_is_counted_when_it_completes():
     event = _delta_event("Hi")
     forwarded, telemetry = await _intercept(
-        [(0, event[:20]), (0.1, event[20:]), (0.1, b"data: [DONE]\n\n")]
+        [(0, event[:20]), (0.1, event[20:]), (0.1, FINISH_EVENT)]
     )
-    assert forwarded == event + b"data: [DONE]\n\n", "the client receives every upstream byte"
+    assert forwarded == event + FINISH_EVENT, "the client receives every upstream byte"
     assert telemetry.accumulated_text == "Hi", "the split event is reassembled"
     assert telemetry.completion_tokens == 1, "the split event is counted once"
     assert telemetry.ttft_ms >= 100.0, "TTFT cannot precede the arrival of the event's second half"
@@ -138,7 +143,7 @@ async def test_event_split_across_chunks_is_counted_when_it_completes():
 
 
 async def test_data_field_without_space_after_colon_is_parsed():
-    chunk = b'data:{"choices": [{"delta": {"content": "Hi"}}]}\n\ndata:[DONE]\n\n'
+    chunk = b'data:{"choices": [{"delta": {"content": "Hi"}}]}\n\ndata:{"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
     _, telemetry = await _intercept([(0, chunk)])
     assert telemetry.accumulated_text == "Hi", "the space after `data:` is optional"
     assert telemetry.completion_tokens == 1
@@ -150,7 +155,7 @@ async def test_multiline_data_with_any_line_ending_fed_byte_by_byte(eol):
         f'data: {{"choices": [{{"delta":{eol}'
         f'data: {{"content": "Hi"}}}}]}}{eol}'
         f": keep-alive comment{eol}{eol}"
-    ).encode("utf-8") + _delta_event("!", eol)
+    ).encode("utf-8") + _delta_event("!", eol) + FINISH_EVENT
     forwarded, telemetry = await _intercept([(0, stream[i : i + 1]) for i in range(len(stream))])
     assert forwarded == stream, "the client receives every upstream byte"
     assert telemetry.accumulated_text == "Hi!", "data lines join with LF and every line ending ends a line"

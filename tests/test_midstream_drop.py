@@ -100,3 +100,121 @@ async def test_error_frame_starts_a_fresh_event_after_upstream_dies_mid_event():
     assert output[len(complete_event):].startswith(b"event: error\n"), (
         "the incomplete event is withheld so the error frame opens a new event"
     )
+
+
+CONTENT_EVENT = b'data: {"choices": [{"index": 0, "delta": {"content": "The answer is"}, "finish_reason": null}]}\n\n'
+FINISH_EVENT = b'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}\n\n'
+
+
+async def _intercept_ending(ending: bytes):
+    async def upstream():
+        yield CONTENT_EVENT
+        if ending:
+            yield ending
+
+    completed, errors, output = [], [], b""
+
+    async def on_complete(telemetry):
+        completed.append(telemetry)
+
+    async def on_error(exc):
+        errors.append(exc)
+
+    async for chunk in telemetry_stream_interceptor(
+        upstream_stream=upstream(),
+        request_id="test-ending",
+        provider_name="groq",
+        model_name="llama3-8b",
+        t_start=time.perf_counter(),
+        on_stream_complete=on_complete,
+        on_stream_error=on_error,
+    ):
+        output += chunk
+    return output, completed, errors
+
+
+@pytest.mark.asyncio
+async def test_stream_with_finish_reason_completes_without_done():
+    output, completed, errors = await _intercept_ending(FINISH_EVENT)
+
+    assert output == CONTENT_EVENT + FINISH_EVENT, "a finished stream is forwarded unchanged"
+    assert len(completed) == 1 and not errors, "a finish_reason marks the stream complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ending, forwarded",
+    [
+        (FINISH_EVENT[:-1], CONTENT_EVENT + FINISH_EVENT),
+        (FINISH_EVENT[:-2], CONTENT_EVENT + FINISH_EVENT),
+        (FINISH_EVENT + b"data: [DONE]\n", CONTENT_EVENT + FINISH_EVENT + b"data: [DONE]\n\n"),
+    ],
+    ids=["finish-single-newline", "finish-no-newline", "done-single-newline"],
+)
+async def test_whole_final_event_without_blank_line_is_dispatched(ending, forwarded):
+    output, completed, errors = await _intercept_ending(ending)
+
+    assert output == forwarded, "the final event reaches the client as a terminated event"
+    assert len(completed) == 1 and not errors, "its finish_reason marks the stream complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ending, forwarded",
+    [
+        (b"", CONTENT_EVENT),
+        (b"data: [DONE]\n\n", CONTENT_EVENT + b"data: [DONE]\n\n"),
+        (b"data: [DONE]\n", CONTENT_EVENT + b"data: [DONE]\n\n"),
+        (b'data: {"choices": [{"delta": {"conte', CONTENT_EVENT),
+        (b'data: {"choices": [{"delta": {"conte\n', CONTENT_EVENT),
+    ],
+    ids=["eof-after-content", "done-without-finish-reason", "unterminated-done-without-finish-reason",
+         "eof-mid-event", "eof-mid-event-after-newline"],
+)
+async def test_stream_that_ends_without_finish_reason_is_a_midstream_failure(ending, forwarded):
+    output, completed, errors = await _intercept_ending(ending)
+
+    assert not completed, "a stream that never finished is not reported complete"
+    assert len(errors) == 1, "a stream that never finished is reported as a mid-stream error"
+    assert output.startswith(forwarded + b"event: error\n"), (
+        "complete events are forwarded, then the error frame opens a new event"
+    )
+    assert b"upstream_connection_broken" in output
+
+
+@pytest.mark.asyncio
+async def test_truncated_stream_is_not_cached_and_counts_as_provider_failure(test_settings):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    upstream_calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_calls.append(request)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=CONTENT_EVENT)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    ctx = gateway.state.ctx
+    spans = InMemorySpanExporter()
+    ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "Truncated upstream stream"}],
+        "stream": True,
+    }
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        first = await c.post("/v1/chat/completions", json=payload)
+        second = await c.post("/v1/chat/completions", json=payload)
+
+    assert first.status_code == 200
+    assert first.content.startswith(CONTENT_EVENT + b"event: error\n"), "the client is told the stream broke"
+    assert second.headers.get("X-Cache") == "MISS", "the truncated text is not replayed from cache"
+    assert len(upstream_calls) == 2
+    primary_cb = ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    assert (await primary_cb.get_metrics())["recent_failures_count"] == 2, "each truncated stream is a provider failure"
+    ended = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    assert [s.status.status_code for s in ended] == [StatusCode.ERROR] * 2, "each span ends with the error"
+    spans.shutdown()
