@@ -118,13 +118,6 @@ async def telemetry_stream_interceptor(
             cached=False,
         )
 
-        # Notify telemetry collectors (Prometheus / OpenTelemetry)
-        if on_stream_complete:
-            try:
-                await on_stream_complete(telemetry)
-            except Exception:
-                pass  # Telemetry emission must not interrupt client streaming
-
     # CancelledError arrives while awaiting upstream bytes, GeneratorExit while parked at a yield.
     except (asyncio.CancelledError, GeneratorExit):
         if on_client_disconnect:
@@ -150,3 +143,11 @@ async def telemetry_stream_interceptor(
             provider=provider_name,
         )
         yield error_frame
+        return
+
+    # Outside the try, so a disconnect while it runs cannot also report the stream as a 499.
+    if on_stream_complete:
+        try:
+            await on_stream_complete(telemetry)
+        except Exception:
+            pass  # Telemetry emission must not interrupt client streaming
