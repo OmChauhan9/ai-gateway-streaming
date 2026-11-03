@@ -88,3 +88,38 @@ async def test_upstream_body_for_a_request_without_stream_adds_only_stream_false
     received = await _bodies_received_by_upstream(test_settings, sent)
 
     assert received == [{**sent, "stream": False}]
+
+
+NON_FINITE_BODIES = {
+    "top_level_extra": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"seed":NaN,"stream":%s}',
+    "message_extra": '{"model":"gpt-4o","messages":[{"role":"user","content":"x","weight":Infinity}],"stream":%s}',
+    "nested": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"metadata":{"w":[1,-Infinity]},"stream":%s}',
+    "modeled_field": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"temperature":NaN,"stream":%s}',
+    "overflowing_literal": '{"model":"gpt-4o","messages":[{"role":"user","content":"x"}],"seed":1e999,"stream":%s}',
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("body", NON_FINITE_BODIES.values(), ids=NON_FINITE_BODIES.keys())
+async def test_non_finite_number_is_a_client_error_with_no_upstream_call(test_settings, stream, body):
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/chat/completions",
+            content=body % ("true" if stream else "false"),
+            headers={"Content-Type": "application/json"},
+        )
+        breakers = (await c.get("/v1/circuit-breakers")).json()
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["detail"]["error"]["type"] == "invalid_request_error"
+    assert calls == [], "a body no upstream can accept is not sent"
+    assert all(b["circuit"]["recent_failures_count"] == 0 for b in breakers.values()), "no provider is charged for it"
