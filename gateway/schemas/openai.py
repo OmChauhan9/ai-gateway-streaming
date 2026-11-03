@@ -5,28 +5,49 @@ Faithful implementation of the standard OpenAI v1 REST specification.
 
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class TextContentPart(BaseModel):
+    """One `{"type": "text"}` entry of a message's list-form content."""
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["text"]
+    text: str
 
 
 class ChatMessage(BaseModel):
     """Individual message in a chat conversation."""
+    model_config = ConfigDict(extra="allow")
+
     role: Literal["system", "user", "assistant", "function", "tool"] = "user"
-    content: str
+    # Null for an assistant turn that only carries tool_calls. Non-text parts (images, audio)
+    # stay rejected because the token estimator has no way to count them.
+    content: Optional[Union[str, List[TextContentPart]]]
     name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _always_forward_role(self) -> "ChatMessage":
+        # The upstream dump keeps only fields the client set, but upstreams reject a
+        # message with no role, so the "user" default must still be sent.
+        self.model_fields_set.add("role")
+        return self
 
 
 class ChatCompletionRequest(BaseModel):
     """Inbound request model for POST /v1/chat/completions."""
+    model_config = ConfigDict(extra="allow")
+
     model: str = Field(..., description="Target model identifier (e.g., llama3-70b-8192, gpt-4o)")
     messages: List[ChatMessage] = Field(..., min_length=1, description="List of messages comprising the conversation")
     stream: bool = Field(default=False, description="Whether to stream back partial progress using SSE")
-    temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
-    top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
-    n: Optional[int] = Field(default=1, ge=1)
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    n: Optional[int] = Field(default=None, ge=1)
     max_tokens: Optional[int] = Field(default=None, ge=1)
     stop: Optional[Union[str, List[str]]] = None
-    presence_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
-    frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
+    presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
     user: Optional[str] = Field(default=None, description="End-user identifier for abuse detection")
 
 

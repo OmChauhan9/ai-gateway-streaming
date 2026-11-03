@@ -6,8 +6,12 @@ Top-tier gateways use calibrated character/subword heuristics for prompt admissi
 ~4 characters per token for English text, with formatting framing adjustments.
 """
 
+import json
 from typing import List, Union
-from gateway.schemas.openai import ChatMessage
+
+from pydantic import BaseModel
+
+from gateway.schemas.openai import ChatCompletionRequest, ChatMessage
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -38,8 +42,13 @@ def estimate_prompt_tokens(messages: Union[List[ChatMessage], List[dict]]) -> in
         num_tokens += 3  # Message framing overhead (<|im_start|>{role}...\n)
         if isinstance(message, ChatMessage):
             role = message.role or ""
-            content = message.content or ""
+            if isinstance(message.content, list):
+                content = "".join(part.text for part in message.content)
+                num_tokens += sum(_forwarded_field_tokens(part) for part in message.content)
+            else:
+                content = message.content or ""
             name = message.name or ""
+            num_tokens += _forwarded_field_tokens(message)
         elif isinstance(message, dict):
             role = message.get("role", "")
             content = message.get("content", "")
@@ -56,3 +65,14 @@ def estimate_prompt_tokens(messages: Union[List[ChatMessage], List[dict]]) -> in
 
     num_tokens += 3  # Priming tokens for assistant response
     return max(1, num_tokens)
+
+
+def _forwarded_field_tokens(model: BaseModel) -> int:
+    # Fields the schema does not model (tools, tool_calls, response_format...) reach the
+    # upstream verbatim, so their JSON is prompt input like any message text.
+    return estimate_text_tokens(json.dumps(model.model_extra)) if model.model_extra else 0
+
+
+def estimate_request_tokens(request: ChatCompletionRequest) -> int:
+    """Estimate prompt tokens for everything the upstream receives: messages and forwarded fields."""
+    return estimate_prompt_tokens(request.messages) + _forwarded_field_tokens(request)
