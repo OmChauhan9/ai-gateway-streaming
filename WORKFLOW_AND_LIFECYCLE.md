@@ -110,8 +110,8 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
 - The cache skips both `get` and `set` when the request has `n` above 1 or has fields the schema does not model.
 - An entry expires `CACHE_TTL_SECONDS` after it was stored. `get` deletes an expired entry and returns a miss.
 - On a hit, the gateway increments `llm_cache_hits_total{cache_type="exact"}` and returns without calling an upstream.
-  - A streaming hit sends one SSE chunk that holds the whole stored text with `finish_reason: "stop"`, then `data: [DONE]`.
-  - A non-streaming hit returns a `chat.completion` JSON body with the stored text, the stored `usage`, and `finish_reason: "stop"`.
+  - A streaming hit sends one SSE chunk that holds the whole stored text with the stored `finish_reason`, then `data: [DONE]`.
+  - A non-streaming hit returns a `chat.completion` JSON body with the stored text, the stored `usage`, and the stored `finish_reason`.
   - The hit response has only `X-Cache: HIT` and `X-Gateway-Request-Id`. It has no provider headers, no span, and no `llm_requests_total` sample. The gateway does not measure TTFT on a hit.
 - On a miss, every later 200 carries `X-Cache: MISS` while the cache is enabled.
 
@@ -163,7 +163,7 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
   data: [DONE]
   ```
 
-  There is no failover, no limiter reconcile, no cache set, and no `llm_requests_total` sample.
+  There is no failover, no limiter reconcile, and no cache set. `llm_requests_total` counts the request with status `502`.
 - If the client disconnects, `on_client_disconnect` records `llm_requests_total{status="499"}` with the content events counted so far. It sets `gateway.client_disconnected` on the span and ends it, and reconciles the limiter. The permit is abandoned, so the breaker records no outcome.
 
 #### Stage 10: after a complete stream
@@ -173,8 +173,8 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
   2. `record_request_metrics(...)` increments `llm_requests_total{provider, model, status="200", stream="true"}`. It observes `llm_ttft_seconds` and `llm_tpot_seconds` when they are above 0. It adds the prompt estimate and the completion count to `llm_tokens_total` and observes `llm_gateway_latency_seconds`.
   3. `record_completion_telemetry(...)` sets `gen_ai.server.ttft` and `gen_ai.server.tpot` (in ms), `gen_ai.usage.completion_tokens`, `gateway.fallback_used`, and `gateway.cached`. It sets status OK and ends the span.
   4. `release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)` adds the completion count to the bucket level, capped at the capacity. The prompt side stays an estimate.
-  5. If the stream carried any content, `cache.set(...)` stores the text and a `usage` built from the estimate and the count. When the cache is full, it evicts the entry that was inserted first.
-- `llm_requests_total` only ever gets `status="200"` and `status="499"` samples. The gateway does not count 4xx, 502, 503, or mid-stream failures in it.
+  5. If the stream carried any content, `cache.set(...)` stores the text, the stream's `finish_reason`, and a `usage` built from the estimate and the count. When the cache is full, it evicts the entry that was inserted first.
+- `llm_requests_total` gets one sample for every response the chat handler sends, under the HTTP status the client received. A stream that fails after its headers counts as `502`, and a client disconnect as `499`. A rejection with no provider involved (413, 429, or every breaker open) uses `provider="none"`. Cache hits and the 400 and 422 rejections add nothing.
 - Prometheus metrics are pull-only, scraped at `GET /metrics`.
 
 ### Non-streaming requests
@@ -183,8 +183,8 @@ Non-streaming requests run stages 1 to 8 the same way, with the same failover th
 - `send_non_streaming_request` returns the upstream's JSON. A 200 whose body is not JSON counts as a provider failure.
 - The gateway settles the permit with `succeed()` as soon as the JSON arrives.
 - It records `llm_requests_total{status="200", stream="false"}` with TTFT and TPOT of 0, and reconciles the limiter from the upstream's `usage.completion_tokens`.
-- It caches `choices[0].message.content` with the upstream's `usage`.
-- On the 502 path where `admit()` chose the fallback directly and that call failed, the gateway does not end the span.
+- It caches `choices[0].message.content` with the upstream's `finish_reason` and `usage`.
+- On the 502 path where `admit()` chose the fallback directly and that call failed, the gateway ends the span with status ERROR.
 
 ---
 
@@ -232,7 +232,7 @@ sequenceDiagram
     GW->>Reg: permit.succeed()
     GW->>Tel: llm_requests_total status 200, TTFT, TPOT, tokens, then end the span with status OK
     GW->>Lim: release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)
-    GW->>Cache: set(payload, accumulated_text, usage)
+    GW->>Cache: set(payload, accumulated_text, finish_reason, usage)
 ```
 
 ---
@@ -248,7 +248,7 @@ sequenceDiagram
     participant Pri as Primary upstream
     participant FB as Fallback breaker
     participant Fb as Fallback upstream
-    participant Tel as Span
+    participant Tel as Span and Prometheus
 
     Client->>GW: POST /v1/chat/completions, stream true
     Note over GW: body checks, limiter acquire and cache miss as in Workflow A
@@ -271,12 +271,12 @@ sequenceDiagram
         else fallback also fails
             Fb-->>GW: provider failure
             GW->>FB: permit.fail()
-            GW->>Tel: end the span with status ERROR
+            GW->>Tel: end the span with status ERROR, llm_requests_total + 1 with the status sent
             GW-->>Client: 503 all_providers_unavailable, or 502 upstream_auth_failed after a 401 or 403
         end
     else fallback breaker refuses
         FB-->>GW: None
-        GW->>Tel: end the span with status ERROR
+        GW->>Tel: end the span with status ERROR, llm_requests_total + 1 with the status sent
         GW-->>Client: 503 all_providers_unavailable, or 502 upstream_auth_failed after a 401 or 403
     end
 ```
@@ -317,13 +317,15 @@ sequenceDiagram
     GW->>Lim: acquire(client_key, 15000)
     alt estimate above capacity
         Lim-->>GW: RequestExceedsCapacity
+        GW->>Prom: llm_requests_total + 1, status 413, provider none
         GW-->>Client: 413 request_exceeds_token_capacity
-        Note over Lim: no charge and no counter change
+        Note over Lim: no charge and no rate-limit counter change
     else estimate fits the capacity
         Lim->>Lim: leak, level = max(0, level - 2000 * dt)
         Lim->>Lim: 43500 + 15000 is more than 50000, overflow 8500
         Lim-->>GW: RateLimitExceeded, retry_after 4.25
         GW->>Prom: llm_rate_limit_exceeded_total + 1
+        GW->>Prom: llm_requests_total + 1, status 429, provider none
         GW-->>Client: 429, Retry-After 5, tokens_per_second_exceeded
     end
     Note over GW,Up: no cache lookup, no admit, no span and no upstream call
@@ -362,10 +364,10 @@ sequenceDiagram
     GW->>Cache: get(payload)
     Cache->>Cache: skip if n is above 1 or the request has unmodeled fields
     Cache->>Cache: SHA-256 key lookup and TTL check
-    Cache-->>GW: (response_text, usage)
+    Cache-->>GW: (response_text, finish_reason, usage)
     GW->>Prom: llm_cache_hits_total cache_type exact + 1
     GW-->>Client: 200 text/event-stream, X-Cache HIT, X-Gateway-Request-Id
-    GW-->>Client: one chunk with the whole text and finish_reason stop
+    GW-->>Client: one chunk with the whole text and the stored finish_reason
     GW-->>Client: data [DONE]
     Note over GW,Up: no admit, no span, no llm_requests_total sample and no upstream call. TTFT is not measured
 ```
@@ -401,7 +403,7 @@ sequenceDiagram
     GW->>Tel: end the span with status ERROR
     GW-->>Client: event error, type upstream_connection_broken, code 502, provider groq
     GW-->>Client: data [DONE]
-    Note over GW: no failover, no llm_requests_total sample, no limiter reconcile and no cache set
+    Note over GW: no failover, no limiter reconcile and no cache set. llm_requests_total counts status 502
 ```
 
 The error event after a dropped connection, from an in-process run against the mock upstream:
