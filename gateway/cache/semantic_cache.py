@@ -13,8 +13,9 @@ from gateway.schemas.openai import ChatCompletionRequest, ChatCompletionResponse
 
 
 class CacheEntry:
-    def __init__(self, response_text: str, created_at: float, ttl: float, usage: dict):
+    def __init__(self, response_text: str, finish_reason: Optional[str], created_at: float, ttl: float, usage: dict):
         self.response_text = response_text
+        self.finish_reason = finish_reason
         self.created_at = created_at
         self.ttl = ttl
         self.usage = usage
@@ -50,11 +51,11 @@ class SemanticCache:
         serialized = json.dumps(key_payload, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
-    async def get(self, request: ChatCompletionRequest) -> Optional[Tuple[str, dict]]:
+    async def get(self, request: ChatCompletionRequest) -> Optional[Tuple[str, Optional[str], dict]]:
         """Look up cached completion for request.
         
         Returns:
-            Optional[Tuple[str, dict]]: (response_text, usage_dict) if found and not expired.
+            Optional[Tuple[str, Optional[str], dict]]: (response_text, finish_reason, usage_dict) if found and not expired.
         """
         if not self.enabled or not _replayable(request):
             return None
@@ -69,12 +70,13 @@ class SemanticCache:
             del self._store[key]
             return None
 
-        return entry.response_text, entry.usage
+        return entry.response_text, entry.finish_reason, entry.usage
 
     async def set(
         self,
         request: ChatCompletionRequest,
         response_text: str,
+        finish_reason: Optional[str],
         usage: Optional[dict] = None,
     ) -> None:
         """Store completion in cache."""
@@ -90,6 +92,7 @@ class SemanticCache:
         now = time.monotonic()
         self._store[key] = CacheEntry(
             response_text=response_text,
+            finish_reason=finish_reason,
             created_at=now,
             ttl=self.ttl,
             usage=usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},

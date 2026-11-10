@@ -190,6 +190,55 @@ async def test_latency_after_failover_counts_from_gateway_ingress(test_settings,
     spans.shutdown()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize(
+    "primary_open, fallback_name, primary_status, fallback_status, expected_status",
+    [
+        (True, "mock-together-fallback", 503, 503, 502),
+        (True, "mock-together-fallback", 503, 401, 502),
+        (False, "", 503, 503, 502),
+        (False, "mock-together-fallback", 400, 200, 400),
+        (False, "mock-together-fallback", 503, 400, 400),
+    ],
+    ids=["open-primary-fallback-503", "open-primary-fallback-401", "no-fallback-503", "primary-400", "fallback-400"],
+)
+async def test_failed_request_ends_its_span_with_error_status(
+    test_settings, stream, primary_open, fallback_name, primary_status, fallback_status, expected_status
+):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    settings = test_settings.model_copy(update={"fallback_provider_name": fallback_name, "cache_enabled": False})
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        code = fallback_status if ":8002" in str(request.url) else primary_status
+        if code == 200:
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+        return httpx.Response(code, json={"error": {"message": f"upstream said {code}"}})
+
+    gateway = create_app(settings=settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker.recovery_timeout = 60.0
+    spans = InMemorySpanExporter()
+    gateway.state.ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "span on failure"}], "stream": stream}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        if primary_open:
+            await c.post("/v1/circuit-breakers/mock-groq-primary/trip")
+        resp = await c.post("/v1/chat/completions", json=payload)
+    finished = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    spans.shutdown()
+
+    assert resp.status_code == expected_status, resp.text
+    assert len(finished) == 1, "the request's span is ended once"
+    assert finished[0].status.status_code == StatusCode.ERROR, "the span records the failure"
+
+
 PRIMARY, FALLBACK = "mock-groq-primary", "mock-together-fallback"
 
 
@@ -270,6 +319,40 @@ async def test_each_chat_response_is_counted_once_under_the_status_the_client_go
     assert increments == {_series("count-outcomes", counted_provider, str(http_status), stream): 1.0}, (
         "exactly one increment, labeled with the status the client received"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_request_cancelled_before_response_ends_its_span_with_error_status(test_settings, stream):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    upstream_called = asyncio.Event()
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_called.set()
+        await asyncio.sleep(10)
+
+    settings = test_settings.model_copy(update={"cache_enabled": False})
+    gateway = create_app(settings=settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    spans = InMemorySpanExporter()
+    gateway.state.ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "cancelled"}], "stream": stream}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        request = asyncio.create_task(c.post("/v1/chat/completions", json=payload))
+        await upstream_called.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+    finished = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    spans.shutdown()
+
+    assert len(finished) == 1, "the cancelled request's span is ended once"
+    assert finished[0].status.status_code == StatusCode.ERROR, "a cancelled request is not recorded as a success"
 
 
 @pytest.mark.asyncio

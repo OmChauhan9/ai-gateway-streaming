@@ -11,23 +11,23 @@ from gateway.stream.sse_parser import iter_sse_events
 FINISH_EVENT = b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
 
 @pytest.mark.parametrize(
-    "event, content, finished",
+    "event, content, finish_reason",
     [
-        (b'data: {"choices": [{"delta": {"role": "assistant"}, "finish_reason": null}]}\n\n', None, False),
-        (b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n', "Hello", False),
-        (b'data: {"choices": [{"delta": {"content": " world!"}}]}\n\n', " world!", False),
-        (b'data: {"choices": [{"delta": {"content": "He said \\"hi\\""}}]}\n\n', 'He said "hi"', False),
-        (FINISH_EVENT, None, True),
-        (b'data: {"choices": [{"delta": {"content": "."}, "finish_reason": "length"}]}\n\n', ".", True),
-        (b"data: [DONE]\n\n", None, False),
+        (b'data: {"choices": [{"delta": {"role": "assistant"}, "finish_reason": null}]}\n\n', None, None),
+        (b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n', "Hello", None),
+        (b'data: {"choices": [{"delta": {"content": " world!"}}]}\n\n', " world!", None),
+        (b'data: {"choices": [{"delta": {"content": "He said \\"hi\\""}}]}\n\n', 'He said "hi"', None),
+        (FINISH_EVENT, None, "stop"),
+        (b'data: {"choices": [{"delta": {"content": "."}, "finish_reason": "length"}]}\n\n', ".", "length"),
+        (b"data: [DONE]\n\n", None, None),
     ],
     ids=["role", "token", "leading-space", "escaped-quotes", "finish", "content-and-finish", "done"],
 )
-async def test_iter_sse_events_extracts_content_and_finish(event, content, finished):
+async def test_iter_sse_events_extracts_content_and_finish(event, content, finish_reason):
     async def upstream():
         yield event
 
-    assert [item async for item in iter_sse_events(upstream())] == [(event, content, finished)]
+    assert [item async for item in iter_sse_events(upstream())] == [(event, content, finish_reason)]
 
 
 @pytest.mark.asyncio
