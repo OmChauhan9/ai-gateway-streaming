@@ -266,7 +266,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         # 2. Semantic / Exact Cache Check
         cached_result = await ctx.cache.get(payload)
         if cached_result:
-            response_text, usage_info = cached_result
+            response_text, finish_reason, usage_info = cached_result
             ctx.metrics.record_cache_hit("exact")
 
             if payload.stream:
@@ -277,7 +277,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": payload.model,
-                        "choices": [{"index": 0, "delta": {"content": response_text}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {"content": response_text}, "finish_reason": finish_reason}],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                     yield b"data: [DONE]\n\n"
@@ -294,7 +294,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         "object": "chat.completion",
                         "created": int(time.time()),
                         "model": payload.model,
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": finish_reason}],
                         "usage": usage_info,
                     },
                     headers={"X-Cache": "HIT", "X-Gateway-Request-Id": req_id},
@@ -393,6 +393,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     await ctx.cache.set(
                         payload,
                         telemetry.accumulated_text,
+                        telemetry.finish_reason,
                         usage={"prompt_tokens": prompt_tokens, "completion_tokens": telemetry.completion_tokens, "total_tokens": actual_total},
                     )
 
@@ -526,7 +527,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             choices = data.get("choices", [])
             content_text = choices[0]["message"]["content"] if choices else ""
             if content_text:
-                await ctx.cache.set(payload, content_text, usage)
+                await ctx.cache.set(payload, content_text, choices[0].get("finish_reason"), usage)
 
             headers = {
                 "X-Gateway-Request-Id": req_id,

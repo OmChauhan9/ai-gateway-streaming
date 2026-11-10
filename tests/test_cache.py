@@ -1,5 +1,7 @@
 """Unit and integration tests for exact and semantic caching."""
 
+import json
+
 import httpx
 import pytest
 
@@ -215,3 +217,47 @@ async def test_disabled_cache_sends_no_cache_header(mock_apps, test_settings, st
         resp = await client.post("/v1/chat/completions", json=payload)
         assert resp.status_code == 200
         assert "X-Cache" not in resp.headers, "a disabled cache reports no cache status"
+
+
+def _finish_reasons(resp: httpx.Response, stream: bool) -> list:
+    if not stream:
+        return [choice["finish_reason"] for choice in resp.json()["choices"]]
+    events = [line[len("data: "):] for line in resp.text.splitlines() if line.startswith("data: ")]
+    return [
+        choice["finish_reason"]
+        for event in events
+        if event != "[DONE]"
+        for choice in json.loads(event)["choices"]
+        if choice.get("finish_reason") is not None
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "stop"])
+async def test_cache_hit_reports_the_upstream_finish_reason(test_settings, stream, finish_reason):
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if stream:
+            body = (
+                b'data: {"choices":[{"index":0,"delta":{"content":"The answer is"}}]}\n\n'
+                + f'data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"{finish_reason}"}}]}}\n\n'.encode()
+                + b"data: [DONE]\n\n"
+            )
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "The answer is"}, "finish_reason": finish_reason}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        )
+
+    app = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "cut me off"}], "max_tokens": 2, "stream": stream}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post("/v1/chat/completions", json=payload)
+        second = await client.post("/v1/chat/completions", json=payload)
+
+    assert first.headers.get("X-Cache") == "MISS"
+    assert second.headers.get("X-Cache") == "HIT", second.text
+    assert _finish_reasons(second, stream) == [finish_reason], "a replay must not report a cut-off answer as complete"
