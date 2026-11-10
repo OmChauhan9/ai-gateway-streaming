@@ -41,3 +41,6 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# Benchmark results (machine-specific; regenerate with the scripts in benchmarks/)
+benchmarks/results/
