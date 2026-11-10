@@ -9,9 +9,9 @@ Three phases against an in-process gateway with two mock upstreams (primary and 
 
 Every breaker transition is recorded with its time through CircuitBreaker.add_transition_listener, and
 every summary line is computed from the recorded responses: status codes, primary vs fallback per phase
-(X-Gateway-Fallback header), streams that ended without `data: [DONE]`, latency per phase, the observed
-transition sequence and the final states. The script exits 1 if any request did not get a 200 or a
-complete stream.
+(X-Gateway-Fallback header), streams that did not end normally (no finish_reason, an error event, or no
+final `data: [DONE]`), latency per phase, the observed transition sequence and the final states. The
+script exits 1 if any request did not get a 200 or a complete stream.
 
 What it does not measure: real providers or real network faults (mocks run in the same event loop over
 in-memory transports that stream body chunks, see tests/conftest.py StreamingASGITransport), mid-stream
@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
 
-from benchmarks._report import describe_machine, print_machine, summarize, write_results
+from benchmarks._report import describe_machine, print_machine, stream_completed, summarize, write_results
 from config.settings import Settings
 from gateway.circuit_breaker.state_machine import CircuitState
 from gateway.main import create_app
@@ -65,7 +65,7 @@ async def send(client: httpx.AsyncClient, phase: str, index: int, t_ref: float) 
         "status": response.status_code,
         "provider": response.headers.get("X-Gateway-Provider"),
         "fallback": response.headers.get("X-Gateway-Fallback"),
-        "complete": body.rstrip().endswith(b"data: [DONE]"),
+        "complete": stream_completed(body),
         "latency_ms": (time.perf_counter() - t0) * 1000.0,
     }
 

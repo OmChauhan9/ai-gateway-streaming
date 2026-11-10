@@ -22,8 +22,8 @@ Modes:
 What it does not measure: a real LLM (the mock streams canned tokens), a real network between hosts,
 cache hits (the cache is off so every request runs the full proxy path), or behavior under concurrency
 (pairs run one at a time). A pair counts as an error, and is left out of the statistics, unless both
-sides return 200 with a body ending in `data: [DONE]` and the gateway served it from the primary, not
-from the fallback or the cache.
+sides return 200 with a body that ends normally (a finish_reason, no error event, then `data: [DONE]`)
+and the gateway served it from the primary, not from the fallback or the cache.
 
 Run from the repository root:
     PYTHONPATH=. python benchmarks/benchmark_overhead.py --mode inprocess
@@ -43,7 +43,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
-from benchmarks._report import REPO_ROOT, describe_machine, print_machine, summarize, write_results
+from benchmarks._report import (
+    REPO_ROOT, describe_machine, print_machine, stream_completed, summarize, write_results,
+)
 from config.settings import Settings
 from gateway.main import create_app
 from gateway.upstream.client import AsyncUpstreamClient
@@ -165,7 +167,7 @@ async def timed_stream(client: httpx.AsyncClient, expect_primary: bool) -> Dict[
                 t_first = time.perf_counter()
             body += chunk
     t_end = time.perf_counter()
-    ok = response.status_code == 200 and body.rstrip().endswith(b"data: [DONE]")
+    ok = response.status_code == 200 and stream_completed(bytes(body))
     if expect_primary:
         ok = ok and response.headers.get("X-Gateway-Fallback") == "false" and response.headers.get("X-Cache") != "HIT"
     return {

@@ -122,6 +122,28 @@ def summarize(values: Sequence[float]) -> Dict[str, Any]:
     }
 
 
+def stream_completed(body: bytes) -> bool:
+    """True if an SSE body finished normally: a choice carried a finish_reason, no error event, and [DONE] last.
+
+    `[DONE]` alone is not enough, because the gateway's mid-stream error frame also ends with it.
+    """
+    events = [e for e in body.replace(b"\r\n", b"\n").split(b"\n\n") if e.strip()]
+    if not events or events[-1].strip() != b"data: [DONE]":
+        return False
+    finished = False
+    for event in events[:-1]:
+        lines = event.split(b"\n")
+        if b"event: error" in lines:
+            return False
+        data = b"\n".join(line[5:].lstrip() for line in lines if line.startswith(b"data:"))
+        try:
+            chunk = json.loads(data)
+        except ValueError:
+            return False
+        finished = finished or any(c.get("finish_reason") for c in chunk.get("choices") or [])
+    return finished
+
+
 def write_results(
     name: str,
     machine: Dict[str, Any],

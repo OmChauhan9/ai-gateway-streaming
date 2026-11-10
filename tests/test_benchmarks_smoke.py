@@ -54,3 +54,17 @@ def test_failover_serves_every_request_and_records_the_breaker_cycle(tmp_path):
     assert summary["primary_state_sequence"] == ["CLOSED", "OPEN", "HALF-OPEN", "CLOSED"]
     assert summary["final_states"]["groq-primary"] == "CLOSED"
     assert len(doc["samples"]) == 13
+
+
+def test_a_stream_ended_by_an_error_frame_is_not_complete():
+    from benchmarks._report import stream_completed
+    from gateway.stream.error_frames import generate_sse_error_frame
+
+    good = (b'data: {"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}\n\n'
+            b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
+            b"data: [DONE]\n\n")
+    broken = b'data: {"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}\n\n' + \
+        generate_sse_error_frame("peer closed", "upstream_connection_broken", 502, "groq")
+    assert stream_completed(good)
+    assert not stream_completed(broken), "the error frame ends in [DONE] too"
+    assert not stream_completed(good.replace(b'"stop"', b"null")), "no finish_reason"
