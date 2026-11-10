@@ -170,7 +170,7 @@ data: [DONE]
 
 ```
 
-The message ends with the exception's text. After the frame, the generator returns and the gateway closes the upstream response. A failed stream adds no sample to `llm_requests_total`.
+The message ends with the exception's text. After the frame, the generator returns and the gateway closes the upstream response. The failed stream is counted in `llm_requests_total` with status `502`, the code in the error event, not `200`.
 
 A client disconnect is not a provider failure. When the client goes away mid-stream, the gateway records status `499` in `llm_requests_total`, ends the span with `gateway.client_disconnected` set to true, and reconciles the client's bucket with the content events streamed so far. The gateway abandons the breaker permit, so the breaker records no outcome.
 
@@ -355,7 +355,7 @@ The deprecations come from the deprecated-attributes table in the core [open-tel
 
 `gateway.cached` is always false. A cache hit returns before the span starts, so no `chat` span exists for a hit. FastAPI 0.162.4, the version in the test environment, also emits its own spans, such as `POST /v1/chat/completions`, through the same tracer provider, and those do appear for cache hits.
 
-The span ends on a success, on a failure after the headers are sent, on a client disconnect, on a 503 after failover, and on a 502 for a streaming request. On two paths it never ends, so it is never exported. One is the 502 for a non-streaming request that went to the fallback at admission. The other is a relayed 4xx.
+Once the span starts, it ends once on each path out of the handler. A success ends it with status OK. A client disconnect ends it with no status set and `gateway.client_disconnected` true. Every other path ends it with status ERROR, including a failure before or after the headers, a relayed 4xx, and a cancelled request.
 
 The gateway configures no span exporter. `OpenTelemetryGenAIManager` reuses the global SDK `TracerProvider` if one is installed, and otherwise installs one with no span processor. The `otel_exporter_endpoint` setting is never read. To export spans, the host process must install an SDK `TracerProvider` with a processor and exporter before it imports `gateway.main`, which builds the app at import time. It can also add a processor to `app.state.ctx.otel.tracer_provider`, which is what the tests do.
 
@@ -368,8 +368,8 @@ Histograms:
 - `llm_gateway_latency_seconds`, labelled `provider` and `status`, with buckets `[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0]`. The gateway observes it with every `llm_requests_total` sample.
 
 Counters:
-- `llm_requests_total`, labelled `provider`, `model`, `status`, and `stream`. The gateway writes only status `200` (a success) and `499` (a client disconnect). Failed requests and cache hits add nothing.
-- `llm_tokens_total`, labelled `provider`, `model`, and `type`, where `type` is `prompt` or `completion`. Prompt tokens are the estimate. Completion tokens are content events for a stream and the provider's `usage.completion_tokens` otherwise. The gateway records them with each `llm_requests_total` sample.
+- `llm_requests_total`, labelled `provider`, `model`, `status`, and `stream`. Every response the chat handler sends adds one sample, under the HTTP status the client received. A stream that fails after its headers counts as `502`, and a client disconnect as `499`. A rejection with no provider involved (413, 429, or every breaker open) uses `provider="none"`. Cache hits, and the 400 and 422 rejections that happen before the handler, add nothing.
+- `llm_tokens_total`, labelled `provider`, `model`, and `type`, where `type` is `prompt` or `completion`. Prompt tokens are the estimate. Completion tokens are content events for a stream and the provider's `usage.completion_tokens` otherwise. The gateway records them with each `llm_requests_total` sample. A failure sample adds 0 tokens.
 - `circuit_breaker_trips_total`, labelled `provider`. It counts every change into OPEN, manual trips included.
 - `llm_rate_limit_exceeded_total`, with no labels. It counts 429 responses from the limiter. A 413 does not count.
 - `llm_cache_hits_total`, labelled `cache_type`, which is always `exact`.
@@ -385,9 +385,9 @@ Some requests repeat exactly, such as a fixed system prompt with the same questi
 
 1. **Key.** The key is the SHA-256 of the request as JSON with sorted keys, after three changes. The gateway drops `stream` and `user`, and it strips leading and trailing whitespace from string message content. Every other request field is part of the key, including `model`, `messages`, `temperature`, `top_p`, `max_tokens`, `stop`, and both penalties. Because `user` is not part of the key, every client shares one cache.
 2. **Skipped requests.** The gateway neither reads nor writes the cache for a request with `n` greater than 1, or for one that carries any field the schema does not model, such as `tools`, `response_format`, or `logprobs`. A replay cannot reproduce those responses.
-3. **What it stores.** It stores the answer text and a `usage` object. For a stream, it stores the joined content once the stream ends normally, with the prompt estimate and the content-event count as `usage`. For a non-streaming response, it stores `choices[0].message.content` and the provider's `usage`. The cache does not store an empty answer.
+3. **What it stores.** It stores the answer text, the upstream's `finish_reason`, and a `usage` object. For a stream, it stores the joined content once the stream ends normally, with the prompt estimate and the content-event count as `usage`. For a non-streaming response, it stores `choices[0].message.content` and the provider's `usage`. The cache does not store an empty answer.
 4. **Expiry and eviction.** An entry expires `cache_ttl_seconds` (300 s by default) after it was stored, and the cache checks expiry on read. When the cache holds `cache_max_size` (1000) entries, storing a new one evicts the oldest stored entry. Reads do not refresh an entry, so eviction is first in, first out.
-5. **Replay.** A hit makes no provider call and carries `X-Cache: HIT`. A non-streaming hit returns a `chat.completion` object with an id that starts `chatcmpl-cache-` and the stored `usage`. A streaming hit sends the whole stored text as one SSE chunk, followed by `data: [DONE]`, with no separate role chunk. Both shapes report `finish_reason: "stop"`, even when the stored answer ended for another reason, such as `length`.
+5. **Replay.** A hit makes no provider call and carries `X-Cache: HIT`. A non-streaming hit returns a `chat.completion` object with an id that starts `chatcmpl-cache-` and the stored `usage`. A streaming hit sends the whole stored text as one SSE chunk, followed by `data: [DONE]`, with no separate role chunk. Both shapes report the stored `finish_reason`, so an answer the upstream cut off replays as `length`, not `stop`.
 
 A miss carries `X-Cache: MISS` when the cache is enabled. A hit increments `llm_cache_hits_total` and nothing else. It creates no `chat` span, no `llm_requests_total` sample, and no latency sample. Nothing times the cache path.
 
@@ -398,8 +398,8 @@ A miss carries `X-Cache: MISS` when the cache is enabled. A hit increments `llm_
 - **Share state.** Breakers, rate-limit buckets, and the cache live in memory in one process. Workers and replicas do not share them, and a restart resets them.
 - **Authenticate clients.** The Bearer token, or the client IP, is only the rate-limit key. Anyone who can reach the gateway can call `/v1/circuit-breakers/{provider}/trip`, `/v1/circuit-breakers/{provider}/reset`, and `/v1/cache/clear`. CORS allows every origin, with credentials.
 - **Export spans.** No span processor or exporter is configured, and `otel_exporter_endpoint` is unused (section 6).
-- **Match similar prompts.** The cache matches exact requests only, evicts oldest first, always reports `finish_reason: "stop"`, and replays a stream as one chunk (section 7).
-- **Record cache hits or failures as requests.** A cache hit is charged against the rate limit but creates no span and no request metric. `llm_requests_total` records only status 200 and 499.
+- **Match similar prompts.** The cache matches exact requests only, evicts oldest first, and replays a stream as one chunk (section 7).
+- **Record cache hits as requests.** A cache hit is charged against the rate limit but creates no span and no `llm_requests_total` sample.
 - **Retry.** Failover is a single hop to one fallback, tried once, with no retries or backoff, and only before response headers are sent. After headers, a failure can only end in an SSE error frame. While a HALF-OPEN primary's probe is out, other requests go to the fallback.
 - **Count tokens exactly.** Prompt tokens are an estimate. Streaming completion "tokens" are content events, and the gateway ignores upstream `usage` on streams. The rate limiter and the cached `usage` both use these numbers.
 - **Accept non-text content.** Message content must be a string or a list of `text` parts. Image and audio parts fail validation (`gateway/schemas/openai.py`).
