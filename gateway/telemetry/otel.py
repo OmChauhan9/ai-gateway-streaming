@@ -77,7 +77,7 @@ class OpenTelemetryGenAIManager:
             span.set_attribute("gateway.fallback_used", fallback_used)
             span.set_attribute("gateway.cached", cached)
 
-            if error:
+            if error is not None:
                 span.set_status(Status(StatusCode.ERROR, description=error))
                 span.set_attribute("error.message", error)
             else:

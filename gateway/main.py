@@ -205,15 +205,16 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 last_exc = fb_exc
                 permit.fail()
                 message = f"Both primary and fallback failed: {fb_exc}"
-            except BaseException:
+            except BaseException as exc:
                 permit.abandon()
+                ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=True, error=str(exc))
                 raise
         ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=permit is not None, error=message)
         raise _cannot_serve(
             last_exc,
             status.HTTP_503_SERVICE_UNAVAILABLE,
             {"error": {"message": message, "type": "all_providers_unavailable"}},
-        )
+        ) from last_exc
 
     # -------------------------------------------------------------------------
     # Core Endpoint: POST /v1/chat/completions
@@ -226,6 +227,30 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         authorization: Optional[str] = Header(None),
     ):
         req_start_time = time.perf_counter()
+        try:
+            return await _serve_chat(payload, request, authorization, req_start_time)
+        except (HTTPException, UpstreamClientError) as exc:
+            # An error response caused by a provider's failure is counted under that provider.
+            cause = exc if isinstance(exc, UpstreamClientError) else exc.__cause__
+            ctx.metrics.record_request_metrics(
+                provider=getattr(cause, "provider", "none"),
+                model=payload.model,
+                status=str(exc.status_code),
+                is_stream=payload.stream,
+                ttft_ms=0.0,
+                tpot_ms=0.0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
+            )
+            raise
+
+    async def _serve_chat(
+        payload: ChatCompletionRequest,
+        request: Request,
+        authorization: Optional[str],
+        req_start_time: float,
+    ):
         req_id = f"gw-{uuid.uuid4().hex[:12]}"
         client_key = _extract_client_key(request, authorization)
 
@@ -265,7 +290,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         # 2. Semantic / Exact Cache Check
         cached_result = await ctx.cache.get(payload)
         if cached_result:
-            response_text, usage_info = cached_result
+            response_text, finish_reason, usage_info = cached_result
             ctx.metrics.record_cache_hit("exact")
 
             if payload.stream:
@@ -276,7 +301,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": payload.model,
-                        "choices": [{"index": 0, "delta": {"content": response_text}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {"content": response_text}, "finish_reason": finish_reason}],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                     yield b"data: [DONE]\n\n"
@@ -293,7 +318,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         "object": "chat.completion",
                         "created": int(time.time()),
                         "model": payload.model,
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": finish_reason}],
                         "usage": usage_info,
                     },
                     headers={"X-Cache": "HIT", "X-Gateway-Request-Id": req_id},
@@ -345,9 +370,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream failure: {str(exc)}", "type": "upstream_error"}},
-                    )
-            except BaseException:
+                    ) from exc
+            except BaseException as exc:
                 permit.abandon()
+                ctx.otel.record_completion_telemetry(
+                    span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
+                )
                 raise
 
             # 5. Non-Blocking SSE Streaming Interceptor
@@ -389,12 +417,24 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     await ctx.cache.set(
                         payload,
                         telemetry.accumulated_text,
+                        telemetry.finish_reason,
                         usage={"prompt_tokens": prompt_tokens, "completion_tokens": telemetry.completion_tokens, "total_tokens": actual_total},
                     )
 
             async def on_stream_error(exc: Exception):
                 # Mid-stream error
                 permit.fail()
+                ctx.metrics.record_request_metrics(
+                    provider=active_provider.name,
+                    model=payload.model,
+                    status="502",
+                    is_stream=True,
+                    ttft_ms=0.0,
+                    tpot_ms=0.0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
+                )
                 ctx.otel.record_completion_telemetry(
                     span=span,
                     ttft_ms=0,
@@ -476,13 +516,19 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     )
                     fallback_diverted = True
                 else:
+                    ctx.otel.record_completion_telemetry(
+                        span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
+                    )
                     raise _cannot_serve(
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream error: {str(exc)}", "type": "upstream_error"}},
-                    )
-            except BaseException:
+                    ) from exc
+            except BaseException as exc:
                 permit.abandon()
+                ctx.otel.record_completion_telemetry(
+                    span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
+                )
                 raise
             permit.succeed()
 
@@ -516,7 +562,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             choices = data.get("choices", [])
             content_text = choices[0]["message"]["content"] if choices else ""
             if content_text:
-                await ctx.cache.set(payload, content_text, usage)
+                await ctx.cache.set(payload, content_text, choices[0].get("finish_reason"), usage)
 
             headers = {
                 "X-Gateway-Request-Id": req_id,
