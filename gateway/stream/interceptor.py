@@ -50,12 +50,13 @@ async def telemetry_stream_interceptor(
     inter_token_intervals: List[float] = []
     previous_token_time: Optional[float] = None
     accumulated_content: List[str] = []
-    finished = False
+    finish_reason: Optional[str] = None
 
     try:
-        async for event, content, event_finished in iter_sse_events(upstream_stream):
+        async for event, content, event_finish_reason in iter_sse_events(upstream_stream):
             now = time.perf_counter()
-            finished = finished or event_finished
+            if finish_reason is None:
+                finish_reason = event_finish_reason
 
             if content:
                 token_count += 1
@@ -78,7 +79,7 @@ async def telemetry_stream_interceptor(
             yield event
 
         # `[DONE]` alone does not prove the answer is whole: vLLM, for one, sends it after an error event.
-        if not finished:
+        if finish_reason is None:
             raise UpstreamConnectionError(provider_name, "stream ended before any choice carried a finish_reason")
 
         t_end = time.perf_counter()
@@ -114,6 +115,7 @@ async def telemetry_stream_interceptor(
             prompt_tokens=prompt_tokens,
             inter_token_latencies_avg_ms=round(avg_itl_ms, 3),
             accumulated_text="".join(accumulated_content),
+            finish_reason=finish_reason,
             fallback_used=fallback_used,
             cached=False,
         )
