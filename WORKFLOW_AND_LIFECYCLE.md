@@ -577,7 +577,7 @@ Gateway overhead, as gateway minus direct over sequential pairs, in milliseconds
 | Loopback TCP | none | 0.90 | 1.19 | 2.03 |
 | Loopback TCP, 2 runs of 150 pairs | 30 ms to the first chunk, 10 ms per token, 15 tokens | 4.52 | 8.47 | 14.43 |
 
-The overhead grows with the time the gateway waits idle for the upstream: the first-chunk gap was 0.6 ms with no delay, 1.1 ms after 5 ms, and 3.5 ms after 30 ms over loopback, and 1.9 ms after 30 ms in-process. The cause is not established. These numbers do not cover a real LLM, a network between hosts, cache hits, or concurrent requests.
+The overhead grows with the time the gateway waits idle for the upstream. Over loopback, the first-chunk gap was 0.6 ms with no delay, 1.1 ms after 5 ms, and 3.5 ms after 30 ms. In-process it was 1.9 ms after 30 ms. The cause is not established. These numbers do not cover a real LLM, a network between hosts, cache hits, or concurrent requests.
 
 Failover, 50 streaming requests:
 
