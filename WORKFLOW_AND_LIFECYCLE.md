@@ -553,7 +553,7 @@ PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode inprocess
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode loopback
 
 # The same, with the mock's own default delays (30 ms to the first chunk, 10 ms per token)
-PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode loopback --ttft-ms 30 --tpot-ms 10
+PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode loopback --ttft-ms 30 --tpot-ms 10 --iterations 150 --runs 2
 
 # Failover under an injected primary outage
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_failover.py
@@ -575,9 +575,9 @@ Gateway overhead, as gateway minus direct over sequential pairs, in milliseconds
 | :--- | :--- | ---: | ---: | ---: |
 | In-process ASGI | none | 0.44 | 0.63 | 0.77 |
 | Loopback TCP | none | 0.90 | 1.19 | 2.03 |
-| Loopback TCP | 30 ms to the first chunk, 10 ms per token, 15 tokens | 4.52 | 8.47 | 14.43 |
+| Loopback TCP, 2 runs of 150 pairs | 30 ms to the first chunk, 10 ms per token, 15 tokens | 4.52 | 8.47 | 14.43 |
 
-The overhead grows when the upstream sits idle between chunks. The cause is not established. These numbers do not cover a real LLM, a network between hosts, cache hits, or concurrent requests.
+The overhead grows with the time the gateway waits idle for the upstream: the first-chunk gap was 0.6 ms with no delay, 1.1 ms after 5 ms, and 3.5 ms after 30 ms over loopback, and 1.9 ms after 30 ms in-process. The cause is not established. These numbers do not cover a real LLM, a network between hosts, cache hits, or concurrent requests.
 
 Failover, 50 streaming requests:
 
