@@ -84,7 +84,7 @@ class CircuitBreaker:
         self.recovery_timeout = recovery_timeout_seconds
         self.half_open_success_threshold = half_open_success_threshold
         self.probe_lease = probe_lease_seconds
-        self._on_transition = on_transition
+        self._listeners: List[TransitionListener] = [on_transition] if on_transition else []
 
         self._state: CircuitState = CircuitState.CLOSED
         self._epoch: int = 0
@@ -96,6 +96,10 @@ class CircuitBreaker:
         self._last_failure_timestamp: Optional[float] = None
         if on_transition:
             on_transition(name, None, self._state)
+
+    def add_transition_listener(self, listener: TransitionListener) -> None:
+        """Also tell `listener` about every later state change. It is not told the current state."""
+        self._listeners.append(listener)
 
     @property
     def state(self) -> CircuitState:
@@ -162,8 +166,9 @@ class CircuitBreaker:
         self._probe = None
         if new_state == CircuitState.CLOSED:
             self._failure_timestamps.clear()
-        if self._on_transition and new_state != old_state:
-            self._on_transition(self.name, old_state, new_state)
+        if new_state != old_state:
+            for listener in self._listeners:
+                listener(self.name, old_state, new_state)
 
     async def get_metrics(self) -> Dict[str, any]:
         """Snapshot current circuit breaker status."""
