@@ -214,7 +214,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             last_exc,
             status.HTTP_503_SERVICE_UNAVAILABLE,
             {"error": {"message": message, "type": "all_providers_unavailable"}},
-        )
+        ) from last_exc
 
     # -------------------------------------------------------------------------
     # Core Endpoint: POST /v1/chat/completions
@@ -227,6 +227,30 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
         authorization: Optional[str] = Header(None),
     ):
         req_start_time = time.perf_counter()
+        try:
+            return await _serve_chat(payload, request, authorization, req_start_time)
+        except (HTTPException, UpstreamClientError) as exc:
+            # An error response caused by a provider's failure is counted under that provider.
+            cause = exc if isinstance(exc, UpstreamClientError) else exc.__cause__
+            ctx.metrics.record_request_metrics(
+                provider=getattr(cause, "provider", "none"),
+                model=payload.model,
+                status=str(exc.status_code),
+                is_stream=payload.stream,
+                ttft_ms=0.0,
+                tpot_ms=0.0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
+            )
+            raise
+
+    async def _serve_chat(
+        payload: ChatCompletionRequest,
+        request: Request,
+        authorization: Optional[str],
+        req_start_time: float,
+    ):
         req_id = f"gw-{uuid.uuid4().hex[:12]}"
         client_key = _extract_client_key(request, authorization)
 
@@ -346,7 +370,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream failure: {str(exc)}", "type": "upstream_error"}},
-                    )
+                    ) from exc
             except BaseException as exc:
                 permit.abandon()
                 ctx.otel.record_completion_telemetry(
@@ -400,6 +424,17 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             async def on_stream_error(exc: Exception):
                 # Mid-stream error
                 permit.fail()
+                ctx.metrics.record_request_metrics(
+                    provider=active_provider.name,
+                    model=payload.model,
+                    status="502",
+                    is_stream=True,
+                    ttft_ms=0.0,
+                    tpot_ms=0.0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_latency_ms=(time.perf_counter() - req_start_time) * 1000.0,
+                )
                 ctx.otel.record_completion_telemetry(
                     span=span,
                     ttft_ms=0,
@@ -488,7 +523,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream error: {str(exc)}", "type": "upstream_error"}},
-                    )
+                    ) from exc
             except BaseException as exc:
                 permit.abandon()
                 ctx.otel.record_completion_telemetry(
