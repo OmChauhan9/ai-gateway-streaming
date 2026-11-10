@@ -16,6 +16,7 @@ class StreamTelemetryData(BaseModel):
     prompt_tokens: int = Field(default=0, description="Estimated prompt tokens")
     inter_token_latencies_avg_ms: float = Field(default=0.0)
     accumulated_text: str = Field(default="", description="Reconstructed text output for caching")
+    finish_reason: Optional[str] = Field(default=None, description="The first finish_reason the stream's choices[0] carried")
     fallback_used: bool = False
     cached: bool = False
 
