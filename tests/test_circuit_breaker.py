@@ -171,6 +171,19 @@ async def test_listener_hears_each_state_change_once():
 
 
 @pytest.mark.asyncio
+async def test_added_listener_hears_later_changes_alongside_the_first():
+    first, added = [], []
+    cb = CircuitBreaker(name="two", on_transition=lambda *change: first.append(change))
+    cb.add_transition_listener(lambda *change: added.append(change))
+    await cb.trip_manually()
+    await cb.reset_manually()
+
+    S = CircuitState
+    assert added == [("two", S.CLOSED, S.OPEN), ("two", S.OPEN, S.CLOSED)], "only changes after it was added"
+    assert first == [("two", None, S.CLOSED), *added], "the constructor's listener still hears everything"
+
+
+@pytest.mark.asyncio
 async def test_unsettled_probe_is_reclaimed_after_its_lease():
     cb = CircuitBreaker(name="lease", recovery_timeout_seconds=0.05, probe_lease_seconds=0.1)
     await _half_open(cb)
