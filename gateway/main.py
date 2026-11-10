@@ -205,8 +205,9 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                 last_exc = fb_exc
                 permit.fail()
                 message = f"Both primary and fallback failed: {fb_exc}"
-            except BaseException:
+            except BaseException as exc:
                 permit.abandon()
+                ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=True, error=str(exc))
                 raise
         ctx.otel.record_completion_telemetry(span, 0, 0, 0, fallback_used=permit is not None, error=message)
         raise _cannot_serve(
@@ -346,8 +347,11 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream failure: {str(exc)}", "type": "upstream_error"}},
                     )
-            except BaseException:
+            except BaseException as exc:
                 permit.abandon()
+                ctx.otel.record_completion_telemetry(
+                    span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
+                )
                 raise
 
             # 5. Non-Blocking SSE Streaming Interceptor
@@ -477,13 +481,19 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     )
                     fallback_diverted = True
                 else:
+                    ctx.otel.record_completion_telemetry(
+                        span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
+                    )
                     raise _cannot_serve(
                         exc,
                         status.HTTP_502_BAD_GATEWAY,
                         {"error": {"message": f"Upstream error: {str(exc)}", "type": "upstream_error"}},
                     )
-            except BaseException:
+            except BaseException as exc:
                 permit.abandon()
+                ctx.otel.record_completion_telemetry(
+                    span, 0, 0, 0, fallback_used=fallback_diverted, error=str(exc)
+                )
                 raise
             permit.succeed()
 
