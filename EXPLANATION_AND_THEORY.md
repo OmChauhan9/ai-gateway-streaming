@@ -369,7 +369,7 @@ Histograms:
 
 Counters:
 - `llm_requests_total`, labelled `provider`, `model`, `status`, and `stream`. Every response the chat handler sends adds one sample, under the HTTP status the client received. A stream that fails after its headers counts as `502`, and a client disconnect as `499`. A rejection with no provider involved (413, 429, or every breaker open) uses `provider="none"`. Cache hits, and the 400 and 422 rejections that happen before the handler, add nothing.
-- `llm_tokens_total`, labelled `provider`, `model`, and `type`, where `type` is `prompt` or `completion`. Prompt tokens are the estimate. Completion tokens are content events for a stream and the provider's `usage.completion_tokens` otherwise. The gateway records them with each `llm_requests_total` sample. A failure sample adds 0 tokens.
+- `llm_tokens_total`, labelled `provider`, `model`, and `type`, where `type` is `prompt` or `completion`. Prompt tokens are the estimate. Completion tokens are content events for a stream and the provider's `usage.completion_tokens` otherwise. The gateway records them with each `llm_requests_total` sample. A stream that fails after its headers records the prompt estimate and the content events already streamed, as a client disconnect does. Other failure samples add 0 tokens, though the limiter keeps the prompt charge for most of them.
 - `circuit_breaker_trips_total`, labelled `provider`. It counts every change into OPEN, manual trips included.
 - `llm_rate_limit_exceeded_total`, with no labels. It counts 429 responses from the limiter. A 413 does not count.
 - `llm_cache_hits_total`, labelled `cache_type`, which is always `exact`.
