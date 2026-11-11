@@ -236,6 +236,16 @@ These endpoints have no authentication.
 
 ---
 
+## Future work
+
+None of these features is built yet. Each one addresses a limitation listed above.
+
+- **Fail over when the first token is too slow.** Today the breaker reacts only to errors. A provider that answers 200 quickly but stalls before its first token looks healthy, and once the gateway has sent the client its headers, it cannot fail over. The plan is a per-provider deadline for the first content event, for example 2 s. The gateway would hold the client's response headers until the first token arrives. If the deadline passes, it would close the primary stream, count a failure on the primary's breaker, and serve the request from the fallback. With no deadline set, behavior would stay as it is now.
+- **Client API keys and protected admin endpoints.** The gateway would read a list of client keys from its settings, store only their SHA-256 hashes, and compare them in constant time. An unknown key would get a 401. Rate-limit buckets would use the key's ID, so a client could no longer reset its budget by changing the bearer string, and each key could have its own budget. The admin endpoints would need a separate admin key, and CORS would no longer allow any origin with credentials.
+- **A provider chain with bounded retries.** An ordered list of providers, each with its own breaker, would replace the single primary and fallback. A failure before the first byte would move the request to the next provider whose breaker admits it. A transient error, such as a connection reset, 502, 503, or 429, would first retry the same provider once after a short random wait. A retry budget, capped at a share of recent traffic, would stop a provider outage from turning into a retry storm.
+
+---
+
 ## Further reading
 
 1. [EXPLANATION_AND_THEORY.md](EXPLANATION_AND_THEORY.md) covers the background: TTFT and TPOT, the leaky bucket, circuit breakers, and SSE, which the WHATWG HTML Living Standard specifies. It ends with references.
