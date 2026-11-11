@@ -3,8 +3,9 @@
 Locust's own entry for `POST /v1/chat/completions` stops its clock when the response headers arrive,
 because the request is made with stream=True, so it says nothing about how long the stream took.
 Each streamed request therefore also reports two custom entries, timed on the client:
-- `stream:ttft`: request sent to the first `data:` event (time to first token as a client sees it).
-- `stream:full`: request sent to `data: [DONE]`.
+- `stream:ttft` times the request until the first event whose `choices[0].delta.content` is a non-empty
+  string. The gateway's own TTFT uses the same rule, so the role-only first event does not stop the clock.
+- `stream:full` times the request until `data: [DONE]`.
 A non-200 response, or a stream that ends without `data: [DONE]`, is a failure.
 
 What it measures: the gateway in front of the mock upstreams (canned tokens with sleeps, not a real LLM),
@@ -30,6 +31,7 @@ Settings reads these environment variables case-insensitively (pydantic-settings
 names map to the fields in config/settings.py.
 """
 
+import json
 import time
 
 from locust import HttpUser, between, task
@@ -43,6 +45,14 @@ PAYLOAD = {
     "stream": True,
     "temperature": 0.7,
 }
+
+
+def _has_content(data: bytes) -> bool:
+    try:
+        content = json.loads(data)["choices"][0]["delta"]["content"]
+    except (ValueError, LookupError, TypeError):
+        return False
+    return isinstance(content, str) and content != ""
 
 
 class AIGatewayStreamingUser(HttpUser):
@@ -83,7 +93,7 @@ class AIGatewayStreamingUser(HttpUser):
                 if line[6:].strip() == b"[DONE]":
                     done = True
                     break
-                if t_first is None:
+                if t_first is None and _has_content(line[6:]):
                     t_first = time.perf_counter()
             t_end = time.perf_counter()
 
@@ -92,7 +102,7 @@ class AIGatewayStreamingUser(HttpUser):
             else:
                 response.success()
 
-        no_token = None if t_first is not None else RuntimeError("stream carried no data event")
+        no_token = None if t_first is not None else RuntimeError("stream carried no content token")
         self._report("stream:ttft", t_start, t_first or t_end, 0, no_token)
         incomplete = None if done else RuntimeError("stream ended without data: [DONE]")
         self._report("stream:full", t_start, t_end, length, incomplete)
