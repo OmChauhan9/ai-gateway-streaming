@@ -20,11 +20,18 @@ class ChatMessage(BaseModel):
     """Individual message in a chat conversation."""
     model_config = ConfigDict(extra="allow")
 
-    role: Literal["system", "user", "assistant", "function", "tool"] = "user"
-    # Null for an assistant turn that only carries tool_calls. Non-text parts (images, audio)
+    role: Literal["developer", "system", "user", "assistant", "function", "tool"] = "user"
+    # Null or absent for an assistant turn that only carries tool_calls. Non-text parts (images, audio)
     # stay rejected because the token estimator has no way to count them.
-    content: Optional[Union[str, List[TextContentPart]]]
+    content: Optional[Union[str, List[TextContentPart]]] = None
     name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _content_required_unless_assistant_calls_a_tool(self) -> "ChatMessage":
+        calls_a_tool = any(self.model_extra.get(field) is not None for field in ("tool_calls", "function_call"))
+        if "content" not in self.model_fields_set and not (self.role == "assistant" and calls_a_tool):
+            raise ValueError("content is required unless an assistant message carries tool_calls")
+        return self
 
     @model_validator(mode="after")
     def _always_forward_role(self) -> "ChatMessage":

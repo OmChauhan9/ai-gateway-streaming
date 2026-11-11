@@ -127,6 +127,49 @@ async def test_tool_loop_second_turn_reaches_the_upstream_unchanged(test_setting
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+async def test_developer_message_and_assistant_tool_call_without_content_reach_the_upstream_unchanged(
+    test_settings, stream
+):
+    sent = _tool_loop_second_turn(stream)
+    del sent["messages"][1]["content"]
+    sent["messages"].insert(0, {"role": "developer", "content": "Answer in French."})
+
+    received = await _bodies_received_by_upstream(test_settings, sent)
+
+    assert received == [sent], "the developer message and the assistant turn with no content key are forwarded as sent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user"},
+        {"role": "developer"},
+        {"role": "assistant"},
+        {"role": "robot", "content": "hi"},
+    ],
+    ids=["user-without-content", "developer-without-content", "assistant-without-content-or-tool-calls", "unknown-role"],
+)
+async def test_message_openai_rejects_is_a_422_with_no_upstream_call(test_settings, message):
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]})
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}, message]},
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert calls == [], "a request OpenAI would reject is not sent"
+
+
+@pytest.mark.asyncio
 async def test_text_part_content_reaches_the_upstream_unchanged(test_settings):
     sent = {
         "model": "gpt-4o",
