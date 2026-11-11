@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     # Server settings
     app_name: str = "Async AI Gateway"
     version: str = "1.0.0"
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"  # set HOST=0.0.0.0 to listen on all interfaces
     port: int = 8000
     debug: bool = False
     workers: int = 1
