@@ -331,6 +331,39 @@ async def test_nonstream_200_without_usable_choices_fails_over_to_fallback(test_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"completion_tokens":NaN}}',
+        b'{"choices":[{"message":{"role":"assistant","content":"hi"},"logprobs":{"x":-Infinity}}]}',
+        b'{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"completion_tokens":1e999}}',
+    ],
+    ids=["nan", "infinity", "overflow"],
+)
+async def test_nonstream_200_with_non_finite_number_fails_over_to_fallback(test_settings, body):
+    import httpx
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if ":8002" in str(request.url):
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "from fallback"}}]})
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, content=body)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    primary_cb = gateway.state.ctx.registry.get_provider("mock-groq-primary").circuit_breaker
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "non-finite primary"}], "stream": False}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get("X-Gateway-Provider") == "mock-together-fallback"
+    assert resp.json()["choices"][0]["message"]["content"] == "from fallback"
+    assert (await primary_cb.get_metrics())["recent_failures_count"] == 1, "a non-finite reply counts as a primary failure"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
 async def test_half_open_sends_one_probe_to_the_primary(test_settings, stream):
     import asyncio
