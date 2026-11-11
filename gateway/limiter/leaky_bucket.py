@@ -126,8 +126,8 @@ class TokenLeakyBucketLimiter:
             if key in self._buckets:
                 state = self._buckets[key]
                 self._leak(state, now)
-                # If actual was lower than estimated, reduce level; if higher, increase
-                state.level = max(0.0, min(self.capacity, state.level + diff))
+                # The level may pass capacity: tokens already served stay owed, so later requests wait for them to drain.
+                state.level = max(0.0, state.level + diff)
 
     async def get_status(self, key: str) -> Dict[str, float]:
         """Get the current level and utilization percentage for a key."""
