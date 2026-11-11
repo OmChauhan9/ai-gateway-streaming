@@ -308,7 +308,7 @@ The upstream client in `gateway/upstream/client.py` sorts each outcome into an e
 | HTTP 5xx | failure | failover |
 | HTTP 429 | failure | failover |
 | HTTP 401 or 403 | failure | failover, or 502 `upstream_auth_failed` when it is the last failure |
-| Non-streaming HTTP 200 whose body is not JSON | failure | failover |
+| Non-streaming HTTP 200 whose body is not JSON, has no list of choices with messages, or contains NaN or Infinity | failure | failover |
 | Exception while reading or parsing a stream | failure | SSE error frame |
 | Stream that ends with no `finish_reason` | failure | SSE error frame |
 | Any other HTTP 4xx, such as 400, 404, or 422 | no outcome | the provider's status and body, with no failover |

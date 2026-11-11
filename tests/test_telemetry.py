@@ -487,6 +487,57 @@ async def test_non_streaming_tool_call_reply_without_content_is_relayed_and_not_
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_non_finite_reply_is_not_counted_as_served_or_cached(test_settings):
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    body = b'{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop","logprobs":{"x":NaN}}]}'
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, content=body)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    payload = {"model": "nan-reply", "messages": [{"role": "user", "content": "nan reply"}], "stream": False}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        before = _request_counts((await c.get("/metrics")).text)
+        first = await c.post("/v1/chat/completions", json=payload)
+        repeat = await c.post("/v1/chat/completions", json=payload)
+        after = _request_counts((await c.get("/metrics")).text)
+
+    assert first.status_code == 503, first.text
+    assert first.json()["error"]["type"] == "all_providers_unavailable"
+    assert repeat.status_code == 503 and repeat.headers.get("X-Cache") is None, "the reply was not cached"
+    increments = {k: v - before.get(k, 0.0) for k, v in after.items() if v != before.get(k, 0.0)}
+    assert increments == {_series("nan-reply", FALLBACK, "503", False): 2.0}, "counted only as the 503s the client got"
+
+
+@pytest.mark.asyncio
+async def test_stream_event_with_nan_is_relayed_and_its_text_replays_as_valid_json(test_settings):
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    events = (
+        b'data: {"choices":[{"index":0,"delta":{"content":"hi"},"logprobs":{"x":NaN}}]}\n\n'
+        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=events)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "nan event"}], "stream": True}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        streamed = await c.post("/v1/chat/completions", json=payload)
+        replayed = await c.post("/v1/chat/completions", json={**payload, "stream": False})
+
+    assert streamed.status_code == 200 and streamed.content == events, "the gateway relays the provider's events as sent"
+    assert replayed.headers.get("X-Cache") == "HIT", replayed.text
+    strict = json.loads(replayed.text, parse_constant=lambda name: pytest.fail(f"replay contains {name}"))
+    assert strict["choices"][0]["message"]["content"] == "hi", "the cache keeps only the text, which replays as valid JSON"
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_reply_with_a_float_completion_count_is_charged(test_settings):
     from gateway.main import create_app
     from gateway.upstream.client import AsyncUpstreamClient

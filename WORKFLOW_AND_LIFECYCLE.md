@@ -180,7 +180,7 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
 ### Non-streaming requests
 
 Non-streaming requests run stages 1 to 8 the same way, with the same failover through `_fail_over`. The differences:
-- `send_non_streaming_request` returns the upstream's JSON. A 200 whose body is not JSON counts as a provider failure.
+- `send_non_streaming_request` returns the upstream's JSON. A 200 counts as a provider failure when its body is not JSON, has no list of choices with messages, or contains NaN or Infinity, which the gateway could not relay as valid JSON.
 - The gateway settles the permit with `succeed()` as soon as the JSON arrives.
 - It records `llm_requests_total{status="200", stream="false"}` with TTFT and TPOT of 0, and reconciles the limiter from the upstream's `usage.completion_tokens`.
 - It caches `choices[0].message.content` with the upstream's `finish_reason` and `usage`.

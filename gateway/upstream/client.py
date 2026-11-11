@@ -4,6 +4,7 @@ Holds one pooled httpx.AsyncClient, sends chat completion requests to the provid
 network and HTTP errors into the Upstream*Error classes below.
 """
 
+import json
 from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 from gateway.circuit_breaker.provider_registry import ProviderInfo
@@ -171,6 +172,8 @@ class AsyncUpstreamClient:
 
         try:
             data = resp.json()
+            # Python's parser accepts NaN, Infinity and 1e999, but the gateway's response encoder does not.
+            json.dumps(data, allow_nan=False)
         except ValueError as exc:
             raise UpstreamServerError(provider.name, resp.status_code, f"Malformed JSON body: {exc}") from exc
         choices = data.get("choices") if isinstance(data, dict) else None
