@@ -304,7 +304,7 @@ The upstream client in `gateway/upstream/client.py` sorts each outcome into an e
 
 | Upstream outcome | Breaker records | What the client gets |
 | :--- | :--- | :--- |
-| Connection error or timeout before headers (connect timeout 5 s, overall timeout 30 s) | failure | failover |
+| Connection error or timeout before headers (connect timeout 5 s, then 30 s for each read, write, or pool wait, with no deadline for the whole request) | failure | failover |
 | HTTP 5xx | failure | failover |
 | HTTP 429 | failure | failover |
 | HTTP 401 or 403 | failure | failover, or 502 `upstream_auth_failed` when it is the last failure |
