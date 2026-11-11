@@ -484,3 +484,50 @@ async def test_non_streaming_tool_call_reply_without_content_is_relayed_and_not_
     assert finished[0].status.status_code == StatusCode.OK, "the span ends as a success"
     assert len(finished) == 2, "one span per request"
     assert repeat.status_code == 200 and len(upstream_calls) == 2, "a reply with no text is not served from cache"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_reply_with_a_float_completion_count_is_charged(test_settings):
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    reply = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 5000.0, "total_tokens": 5005.0},
+    }
+    gateway = create_app(
+        settings=test_settings.model_copy(update={"cache_enabled": False}),
+        client=AsyncUpstreamClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply))),
+    )
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "float usage"}], "stream": False}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        resp = await c.post("/v1/chat/completions", json=payload, headers={"Authorization": "Bearer float"})
+        bucket = (await c.get("/v1/rate-limiter/status", headers={"Authorization": "Bearer float"})).json()["bucket"]
+
+    assert resp.status_code == 200, resp.text
+    assert bucket["level"] > 4900, "a whole-number float count is charged like the integer it is"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_reply_with_list_content_is_not_replayed_as_a_list(test_settings):
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    reply = {
+        "choices": [{
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+            "finish_reason": "stop",
+        }],
+    }
+    gateway = create_app(
+        settings=test_settings,
+        client=AsyncUpstreamClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply))),
+    )
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "list content"}], "stream": False}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url="http://test") as c:
+        first = await c.post("/v1/chat/completions", json=payload)
+        again = await c.post("/v1/chat/completions", json={**payload, "stream": True})
+
+    assert first.status_code == 200, first.text
+    assert first.json()["choices"][0]["message"]["content"] == [{"type": "text", "text": "hello"}], "relayed as sent"
+    assert again.headers.get("X-Cache") == "MISS", "only string content is cached, so a stream never replays a list"
