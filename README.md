@@ -100,7 +100,7 @@ This benchmark runs in-process against two mocks. During the outage phase, the p
 | Primary outage (503) | 25 | all at once | 25 | 0 | 25 |
 | After recovery | 15 | one at a time | 15 | 15 | 0 |
 
-All 50 requests got HTTP 200 and a stream that ended normally, with no error events. The primary's breaker went from CLOSED to OPEN at 2.06 s, to HALF-OPEN at 2.88 s, and back to CLOSED at 3.29 s. These times count from the start of the run, so they include about 2 s of normal traffic before the outage. The benchmark shortens the breaker's cooldown to 0.5 s (the default is 15 s), and the breaker moves to HALF-OPEN on the first request after the cooldown, not the moment it ends.
+All 50 requests got HTTP 200 and a stream that ended normally, with no error events. The primary's breaker went from CLOSED to OPEN at 2.06 s, to HALF-OPEN at 2.88 s, and back to CLOSED at 3.29 s. These times count from the start of the run, so they include about 2 s of normal traffic before the outage. The benchmark shortens the breaker's cooldown to 0.5 s (the default is 15 s), and the breaker moves to HALF-OPEN the first time anything reads its state after the cooldown, such as a request or a status call, not the moment the cooldown ends. During the outage, requests took 245 ms at the median, against 202 ms before it.
 
 This run covers failures that happen before the response starts. It does not cover mid-stream failures, real providers, or real network faults.
 
@@ -120,7 +120,7 @@ uv venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
-These commands use [uv](https://docs.astral.sh/uv/). Without uv, run `python3 -m venv .venv` and then `.venv/bin/pip install -e ".[dev]"`. The project needs Python 3.11 or later.
+These commands use [uv](https://docs.astral.sh/uv/). Without uv, run `python3 -m venv .venv` and then `.venv/bin/pip install -e ".[dev]"`. The project needs Python 3.11 or later, so check `python3 --version` first. An older Python makes pip fail with a `setup.py` not found error that does not mention the version.
 
 ### 2. Start the mock upstreams
 The mock streams canned tokens and supports fault injection. It runs the primary on `:8001` and the fallback on `:8002`.
@@ -133,17 +133,18 @@ In a separate terminal, run:
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/run_gateway.py
 ```
-The gateway listens on `http://127.0.0.1:8000`. Set `HOST=0.0.0.0` to listen on every network interface, but note that the admin endpoints have no authentication. To use real providers, set `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `FALLBACK_BASE_URL`, and `FALLBACK_API_KEY`. See `.env.example` and `config/settings.py` for every setting.
+The gateway listens on `http://127.0.0.1:8000`. Set `HOST=0.0.0.0` to listen on every network interface, but note that the admin endpoints have no authentication. To use real providers, set `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `FALLBACK_BASE_URL`, and `FALLBACK_API_KEY`. A base URL must include the provider's `/v1` part, because the gateway appends `/chat/completions` to it. See `.env.example` and `config/settings.py` for every setting.
 
 ### 4. Stream from the demo client
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/demo_client.py --prompt "How does an async AI gateway manage inference reliability?"
 ```
-If you send the same prompt again within 5 minutes, the cache answers it. The demo then reports no provider, and the whole answer arrives as one event. Change the prompt to reach the mock again.
+If you send the same prompt again within 5 minutes, the cache answers it. The demo then reports no provider, and the whole answer arrives as one event. Change the prompt to reach the mock again. The demo's TTFT is far above the gateway's added latency because it includes the mock's 30 ms delay before the first token and a new connection.
 
 ### 5. Run a failover drill
-With the mock and the gateway running, force the primary's breaker open, then send a request:
+The cache answers a repeated request without calling any provider, so a repeat shows `X-Cache: HIT` and no provider headers. Empty the cache first, and send a different message each time:
 ```bash
+curl -X POST http://127.0.0.1:8000/v1/cache/clear
 curl -X POST http://127.0.0.1:8000/v1/circuit-breakers/groq/trip
 curl -i -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -151,12 +152,19 @@ curl -i -X POST http://127.0.0.1:8000/v1/chat/completions \
 ```
 The response headers show `X-Gateway-Provider: together` and `X-Gateway-Fallback: true`. The trip lasts one cooldown, 15 s by default. After that, the next request tests the primary, and two successful tests close the breaker. `POST /v1/circuit-breakers/groq/reset` closes it at once.
 
-To make the primary fail for real, inject a fault into its mock, and remove it afterwards:
+To make the primary fail for real, inject a fault into its mock, send six requests with different messages, and look at the breakers:
 ```bash
+curl -X POST http://127.0.0.1:8000/v1/circuit-breakers/groq/reset
 curl -X POST http://127.0.0.1:8001/admin/fault-injection -H "Content-Type: application/json" -d '{"fail_with_status": 503}'
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -D - -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "{\"model\": \"llama3-8b\", \"messages\": [{\"role\": \"user\", \"content\": \"fault drill $i\"}]}" | grep -i x-gateway-provider
+done
+curl http://127.0.0.1:8000/v1/circuit-breakers
 curl -X POST http://127.0.0.1:8001/admin/reset
 ```
-While the fault is on, requests still get a 200 from `together`. After 5 failures within 10 s, the primary's breaker opens and the gateway stops trying the primary until the cooldown ends.
+Every request gets a 200 from `together`. After 5 failures within 10 s, the primary's breaker is OPEN, and the gateway stops trying the primary until the cooldown ends. The last command removes the fault.
 
 ---
 
@@ -265,9 +273,9 @@ Every setting can be changed with an environment variable or a `.env` file. See 
 
 - **No client authentication.** The gateway does not check who a client is. A client that changes its bearer string gets a fresh rate-limit bucket. Anyone who can reach the gateway can call the admin endpoints, which can trip breakers and clear the cache. CORS allows any origin, with credentials.
 - **State lives in one process.** Breakers, rate-limit buckets, and the cache are in memory. Each worker or replica has its own copy, and a restart clears them.
-- **The cache matches exact requests only.** Any change to the messages or the generation parameters is a miss, with two exceptions. The key ignores whitespace at the start and end of each message's text, and it ignores the `user` field, so all clients share one cache. The gateway skips the cache for `n > 1` and for request fields it does not model. A streamed hit arrives as a single SSE event. Cache hits create no span, so the `gateway.cached` span attribute is always false.
-- **Token counts are estimates.** The prompt estimate is the character count divided by 4, rounded up, for each message's role, content, and name, plus 3 tokens per message and 3 more per request. It is not a tokenizer's count. On streams, the completion count is the number of content-bearing SSE events.
-- **The breaker reacts only to errors.** A provider that answers 200 quickly and then stalls before its first token counts as healthy.
+- **The cache matches exact requests only.** Any change to the messages or the generation parameters is a miss, with three exceptions. The key ignores whitespace at the start and end of each message's text when that text is a plain string. It ignores the `stream` flag, so a streaming request can hit an answer cached from a non-streaming one. It ignores the `user` field, so all clients share one cache. The gateway skips the cache for `n > 1` and for request fields it does not model. A streamed hit arrives as a single SSE event. Cache hits create no span, so the `gateway.cached` span attribute is always false.
+- **Token counts are estimates.** The prompt estimate is the character count divided by 4, rounded up, for each message's role, content, and name, plus 1 more for a message with a name, 3 per message, and 3 per request. Request fields the gateway does not model, such as `tools`, add their JSON length divided by 4. It is not a tokenizer's count. On streams, the completion count is the number of content-bearing SSE events.
+- **The breaker reacts only to errors.** A provider that answers 200 quickly and then stalls before its first token counts as healthy, as long as each stall is shorter than the read timeout (30 s by default).
 - **Failover is one hop, and happens only before the first byte.** There is one fallback. The gateway tries it once and does not retry with backoff. A failure after the stream starts ends in an error event.
 - **The OpenTelemetry names are not current.** `gen_ai.system`, `gen_ai.usage.prompt_tokens`, and `gen_ai.usage.completion_tokens` are deprecated. Their replacements are `gen_ai.provider.name`, `gen_ai.usage.input_tokens`, and `gen_ai.usage.output_tokens`. `gen_ai.request.streaming`, `gen_ai.server.ttft`, and `gen_ai.server.tpot` are custom names. The gateway configures no span exporter, so the host application must set one up.
 - **Only the mock is tested.** No test or benchmark in this repository runs against a real provider.
