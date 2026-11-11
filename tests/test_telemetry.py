@@ -496,7 +496,7 @@ async def test_non_streaming_reply_with_a_float_completion_count_is_charged(test
         "usage": {"prompt_tokens": 5, "completion_tokens": 5000.0, "total_tokens": 5005.0},
     }
     gateway = create_app(
-        settings=test_settings.model_copy(update={"cache_enabled": False}),
+        settings=test_settings.model_copy(update={"cache_enabled": False, "rate_limiter_capacity_tokens": 100_000}),
         client=AsyncUpstreamClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=reply))),
     )
     payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "float usage"}], "stream": False}

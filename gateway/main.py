@@ -11,6 +11,7 @@ Production-grade inference proxy providing:
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import math
 import time
 import uuid
 from typing import AsyncIterator, Optional
@@ -538,8 +539,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             if not isinstance(usage, dict):
                 usage = {}
             comp_tokens = usage.get("completion_tokens")
-            if not isinstance(comp_tokens, int):
+            # JSON allows 7.0 for a count; anything that is not a finite number counts as 0.
+            if isinstance(comp_tokens, bool) or not isinstance(comp_tokens, (int, float)) or not math.isfinite(comp_tokens):
                 comp_tokens = 0
+            comp_tokens = int(round(comp_tokens))
 
             ctx.metrics.record_request_metrics(
                 provider=active_provider.name,
@@ -566,7 +569,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
             choices = data["choices"]
             content_text = choices[0]["message"].get("content") if choices else ""
-            if content_text:
+            # Only text is cached: a streamed hit replays it as `delta.content`, which clients expect to be a string.
+            if isinstance(content_text, str) and content_text:
                 await ctx.cache.set(payload, content_text, choices[0].get("finish_reason"), usage)
 
             headers = {
