@@ -1,7 +1,7 @@
 """In-memory Token Leaky-Bucket Rate Limiter.
 
-Production LLM inference requires token-budgeting rather than simple request counts:
-a 10-token prompt and an 8,000-token prompt have vastly different GPU resource costs.
+The limiter budgets tokens, not requests, because an 8,000-token prompt is 800 times the input of
+a 10-token prompt.
 
 The Leaky Bucket algorithm smooths out token bursts:
 - Capacity (C): The burst limit. Maximum tokens that can be committed immediately.
@@ -50,7 +50,7 @@ class BucketState:
 
 
 class TokenLeakyBucketLimiter:
-    """Asynchronous, thread-safe In-Memory Leaky Bucket Token Rate Limiter."""
+    """In-memory leaky-bucket token limiter. One asyncio.Lock serializes access within one event loop. It is not thread-safe."""
 
     def __init__(
         self,

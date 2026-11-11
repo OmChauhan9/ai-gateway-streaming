@@ -1,8 +1,8 @@
-"""High-speed exact and normalized semantic cache for LLM requests.
+"""Exact-match TTL cache for chat completions.
 
-Eliminates redundant upstream model invocations by hashing every request field that can
-change the generated output (model, normalized messages, sampling and length parameters)
-with time-to-live (TTL) expiration.
+The key is the SHA-256 of the request without `stream` and `user`, with string message content
+stripped of surrounding whitespace. Any other difference is a different key. There is no semantic
+matching, despite the module and class names. Entries expire after the TTL.
 """
 
 import hashlib
@@ -31,7 +31,7 @@ def _replayable(request: ChatCompletionRequest) -> bool:
 
 
 class SemanticCache:
-    """In-memory LRU-like TTL cache for LLM completions."""
+    """In-memory TTL cache. When full, `set` evicts the oldest key in insertion order. `get` does not reorder keys."""
 
     def __init__(self, ttl_seconds: int = 300, max_size: int = 1000, enabled: bool = True):
         self.ttl = float(ttl_seconds)

@@ -1,7 +1,7 @@
 """Async HTTP Client for Upstream LLM Providers.
 
-Configured with high-performance connection pooling, keep-alives, and timeouts.
-Dispatches requests to upstream endpoints and normalizes network/protocol errors.
+Holds one pooled httpx.AsyncClient, sends chat completion requests to the providers, and turns
+network and HTTP errors into the Upstream*Error classes below.
 """
 
 from typing import Any, AsyncIterator, Dict, Optional
@@ -49,7 +49,7 @@ class UpstreamClientError(UpstreamException):
 
 
 class AsyncUpstreamClient:
-    """Production async HTTP client managing connections to upstream providers."""
+    """Async HTTP client for the upstream providers, with one shared connection pool."""
 
     def __init__(
         self,

@@ -1,11 +1,11 @@
 """Async AI Gateway with Streaming Telemetry & Circuit Breaking.
 
-Production-grade inference proxy providing:
+A proxy for OpenAI-style chat completion requests, with:
 1. Token Leaky-Bucket Rate Limiter (prompt token estimation + reconciliation)
-2. Semantic / Exact Cache Check (instant hit delivery)
-3. Tri-State Circuit Breakers with Transparent Multi-Provider Failover
-4. Non-Blocking SSE Streaming Interceptor (real-time TTFT & TPOT profiling)
-5. OpenTelemetry GenAI Semantic Conventions & Prometheus Observability
+2. Exact-match response cache
+3. Tri-State Circuit Breakers with failover from the primary to one fallback provider
+4. SSE streaming interceptor that measures TTFT and TPOT
+5. OpenTelemetry spans with gen_ai.* attributes, and Prometheus metrics
 """
 
 import asyncio
@@ -288,7 +288,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     headers=headers,
                 )
 
-        # 2. Semantic / Exact Cache Check
+        # 2. Exact cache check
         cached_result = await ctx.cache.get(payload)
         if cached_result:
             response_text, finish_reason, usage_info = cached_result
@@ -643,7 +643,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
     @app.post("/v1/cache/clear")
     async def clear_cache():
-        """Purge semantic/exact cache."""
+        """Empty the exact-match response cache."""
         ctx.cache.clear()
         return {"status": "cache_cleared"}
 
