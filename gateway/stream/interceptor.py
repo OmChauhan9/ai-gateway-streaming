@@ -1,11 +1,13 @@
-"""Non-blocking Server-Sent Events (SSE) Streaming Interceptor.
+"""Server-Sent Events (SSE) interceptor that times a streamed reply.
 
-Wraps the upstream response chunk generator inside an async generator to profile:
+`telemetry_stream_interceptor` forwards each complete upstream SSE event to the client as it arrives,
+without buffering the whole response. It counts each event whose `choices[0].delta.content` is a
+non-empty string as one completion token, and from their arrival times it computes:
 - TTFT (Time To First Token): T_first - T_start
 - TPOT (Time Per Output Token): (T_last - T_first) / (N_tokens - 1)
-- Inter-Token Latencies (ITL) and token throughput (tokens/sec)
+- the mean gap between content events, reported as `inter_token_latencies_avg_ms`
 
-Maintains <5ms gateway latency overhead by avoiding whole-response buffering.
+The benchmark results section of README.md reports the measured gateway overhead.
 """
 
 import asyncio
@@ -29,7 +31,7 @@ async def telemetry_stream_interceptor(
     on_stream_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
     on_client_disconnect: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> AsyncIterator[bytes]:
-    """Async generator interceptor profiling streaming LLM metrics in real time.
+    """Forward the upstream SSE events and time the stream.
     
     Args:
         upstream_stream: Raw byte chunks from httpx response.aiter_bytes()
@@ -40,7 +42,7 @@ async def telemetry_stream_interceptor(
         prompt_tokens: Estimated prompt tokens
         fallback_used: Whether failover occurred
         on_stream_complete: Coroutine invoked with finalized telemetry data
-        on_stream_error: Coroutine invoked if upstream drops mid-stream
+        on_stream_error: Coroutine invoked if the stream fails or ends with no finish_reason
         on_client_disconnect: Coroutine invoked with the completion tokens streamed so far
             if the client goes away mid-stream; the cancellation still propagates
     """

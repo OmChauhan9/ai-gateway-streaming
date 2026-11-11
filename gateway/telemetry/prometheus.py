@@ -1,11 +1,14 @@
 """Prometheus Metrics Exporter for AI Gateway.
 
-Provides Prometheus metrics for real-time observability dashboards:
+Defines the Prometheus metrics that GET /metrics serves:
+- Request counter by provider, model, status, and stream flag
 - LLM Time To First Token (TTFT) histograms
 - LLM Time Per Output Token (TPOT) histograms
 - Total prompt and completion token counters
 - Tri-state circuit breaker gauges and trip counters
+- Gateway latency histogram
 - Token rate limiter exhaustion counters
+- Cache hit counter
 """
 
 from typing import Optional

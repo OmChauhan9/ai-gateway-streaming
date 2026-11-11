@@ -5,14 +5,14 @@ from pydantic import BaseModel, Field
 
 
 class StreamTelemetryData(BaseModel):
-    """Real-time latency profiling and token throughput record for an inference stream."""
+    """Latency and token counts measured for one streamed reply."""
     request_id: str
     provider: str
     model: str
     ttft_ms: float = Field(..., description="Time to First Token in milliseconds (T_first - T_start)")
     tpot_ms: float = Field(..., description="Time per Output Token in milliseconds ((T_last - T_first) / (N - 1))")
     total_latency_ms: float = Field(..., description="End-to-end stream duration in milliseconds")
-    completion_tokens: int = Field(..., description="Total output tokens counted in the stream")
+    completion_tokens: int = Field(..., description="Number of SSE events with non-empty content, counted as completion tokens")
     prompt_tokens: int = Field(default=0, description="Estimated prompt tokens")
     inter_token_latencies_avg_ms: float = Field(default=0.0)
     accumulated_text: str = Field(default="", description="Reconstructed text output for caching")

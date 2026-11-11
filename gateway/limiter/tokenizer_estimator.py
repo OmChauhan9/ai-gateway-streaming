@@ -1,9 +1,9 @@
-"""High-performance token estimation heuristic.
+"""Prompt token estimate for the rate limiter, computed without a tokenizer.
 
-In production gateways, running full BPE tokenization (tiktoken / tokenizers) on every
-request CPU-blocks the asyncio event loop under thousands of concurrent requests.
-Top-tier gateways use calibrated character/subword heuristics for prompt admission:
-~4 characters per token for English text, with formatting framing adjustments.
+Each piece of text counts as its character count divided by 4, rounded up. The estimate adds fixed
+framing tokens for each message and for the reply, and counts fields the schema does not model as
+their JSON length divided by 4. The estimate avoids running a BPE tokenizer such as tiktoken on the
+event loop for every request. It is not a tokenizer's count.
 """
 
 import json
@@ -19,7 +19,6 @@ def estimate_text_tokens(text: str) -> int:
     
     Formula:
     tokens = max(1, ceil(len(text) / 4))
-    Adjusted slightly for whitespace density.
     """
     if not text:
         return 0

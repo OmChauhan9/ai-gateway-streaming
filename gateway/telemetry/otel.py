@@ -1,17 +1,21 @@
-"""OpenTelemetry GenAI Semantic Conventions Instrumentation.
+"""OpenTelemetry span for each chat completion request.
 
-Adheres strictly to the official OpenTelemetry GenAI Semantic Conventions specification:
-https://opentelemetry.io/docs/specs/semconv/gen-ai/
+Each request gets one SERVER span named `chat <model>`. The gateway sets these attributes on it:
+- gen_ai.system is the provider name. After a failover, gateway/main.py sets it to the fallback's name.
+- gen_ai.request.model is the model name from the request.
+- gen_ai.request.streaming is the request's stream flag.
+- gen_ai.usage.prompt_tokens is the gateway's prompt estimate.
+- gen_ai.usage.completion_tokens is the completion token count.
+- gen_ai.server.ttft and gen_ai.server.tpot are TTFT and TPOT in milliseconds.
+- gateway.request_id, gateway.fallback_used, and gateway.cached.
+- gateway.client_disconnected, set by gateway/main.py when the client leaves mid-stream.
+- error.message, set with an ERROR status when the request fails.
 
-Standard Span Attributes:
-- gen_ai.system: The target AI system/provider (e.g. 'groq', 'openai', 'anthropic')
-- gen_ai.request.model: The requested model name
-- gen_ai.usage.prompt_tokens: Estimated or reported prompt tokens
-- gen_ai.usage.completion_tokens: Counted completion tokens
-- gen_ai.server.ttft: Time To First Token in milliseconds
-- gen_ai.server.tpot: Time Per Output Token in milliseconds
-- gen_ai.response.finish_reasons: Completion termination reason
-- gateway.fallback_used: Whether request was rerouted due to primary circuit trip
+Some of these names differ from the OpenTelemetry GenAI conventions at
+https://opentelemetry.io/docs/specs/semconv/gen-ai/. gen_ai.system, gen_ai.usage.prompt_tokens, and
+gen_ai.usage.completion_tokens are deprecated. gen_ai.request.streaming, gen_ai.server.ttft, and
+gen_ai.server.tpot are custom. The gateway configures no span exporter. The Limitations section of
+README.md lists these gaps.
 """
 
 from typing import Any, Dict, Optional
@@ -23,7 +27,7 @@ from opentelemetry.trace import Status, StatusCode, Span
 
 
 class OpenTelemetryGenAIManager:
-    """Manages OpenTelemetry tracing and GenAI semantic conventions."""
+    """Creates and closes the gateway's request spans."""
 
     def __init__(self, service_name: str = "ai-gateway-proxy"):
         self.service_name = service_name
