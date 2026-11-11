@@ -83,12 +83,12 @@ class SemanticCache:
         if not self.enabled or self.max_size <= 0 or not _replayable(request):
             return
 
-        if len(self._store) >= self.max_size:
+        key = self._generate_key(request)
+        if key not in self._store and len(self._store) >= self.max_size:
             # Simple eviction of oldest item
             oldest_key = next(iter(self._store))
             del self._store[oldest_key]
 
-        key = self._generate_key(request)
         now = time.monotonic()
         self._store[key] = CacheEntry(
             response_text=response_text,
