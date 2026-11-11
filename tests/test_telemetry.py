@@ -389,10 +389,15 @@ async def test_stream_that_fails_after_headers_is_counted_as_502(test_settings):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "usage",
-    [None, {"prompt_tokens": 5, "completion_tokens": None, "total_tokens": None}],
-    ids=["usage-null", "completion-tokens-null"],
+    [
+        None,
+        {"prompt_tokens": 5, "completion_tokens": None, "total_tokens": None},
+        ["not", "an", "object"],
+        {"prompt_tokens": 5, "completion_tokens": "7", "total_tokens": "12"},
+    ],
+    ids=["usage-null", "completion-tokens-null", "usage-not-object", "completion-tokens-not-int"],
 )
-async def test_non_streaming_reply_with_null_usage_is_served_and_traced(test_settings, usage):
+async def test_non_streaming_reply_with_unusable_usage_is_served_and_traced(test_settings, usage):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
     from opentelemetry.trace import StatusCode
@@ -422,3 +427,60 @@ async def test_non_streaming_reply_with_null_usage_is_served_and_traced(test_set
     assert len(finished) == 1 and finished[0].status.status_code == StatusCode.OK, "the span ends once, as a success"
     increments = {k: v - before.get(k, 0.0) for k, v in after.items() if v != before.get(k, 0.0)}
     assert increments == {_series("llama3-8b", PRIMARY, "200", False): 1.0}, "counted once, as a 200"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_tool_call_reply_without_content_is_relayed_and_not_cached(test_settings):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    reply = {
+        "id": "chatcmpl-tool",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "llama3-8b",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+            },
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+    }
+    upstream_calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_calls.append(request)
+        return httpx.Response(200, json=reply)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    spans = InMemorySpanExporter()
+    gateway.state.ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    payload = {
+        "model": "llama3-8b",
+        "messages": [{"role": "user", "content": "call a tool"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        "stream": False,
+    }
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        before = _request_counts((await c.get("/metrics")).text)
+        resp = await c.post("/v1/chat/completions", json=payload)
+        after = _request_counts((await c.get("/metrics")).text)
+        repeat = await c.post("/v1/chat/completions", json=payload)
+    finished = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    spans.shutdown()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == reply, "the provider's tool-call reply reaches the client unchanged"
+    increments = {k: v - before.get(k, 0.0) for k, v in after.items() if v != before.get(k, 0.0)}
+    assert increments == {_series("llama3-8b", PRIMARY, "200", False): 1.0}, "counted once, as a 200"
+    assert finished[0].status.status_code == StatusCode.OK, "the span ends as a success"
+    assert len(finished) == 2, "one span per request"
+    assert repeat.status_code == 200 and len(upstream_calls) == 2, "a reply with no text is not served from cache"
