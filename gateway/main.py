@@ -422,7 +422,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         usage={"prompt_tokens": prompt_tokens, "completion_tokens": telemetry.completion_tokens, "total_tokens": actual_total},
                     )
 
-            async def on_stream_error(exc: Exception):
+            async def on_stream_error(exc: Exception, completion_tokens: int):
                 # Mid-stream error
                 permit.fail()
                 ctx.metrics.record_request_metrics(
@@ -444,6 +444,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     fallback_used=fallback_diverted,
                     error=str(exc),
                 )
+                await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)
 
             async def on_client_disconnect(completion_tokens: int):
                 # Says nothing about provider health, so the circuit breaker records no outcome.
