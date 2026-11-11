@@ -261,3 +261,21 @@ async def test_cache_hit_reports_the_upstream_finish_reason(test_settings, strea
     assert first.headers.get("X-Cache") == "MISS"
     assert second.headers.get("X-Cache") == "HIT", second.text
     assert _finish_reasons(second, stream) == [finish_reason], "a replay must not report a cut-off answer as complete"
+
+
+@pytest.mark.asyncio
+async def test_overwriting_a_cached_request_in_a_full_cache_keeps_the_other_entries():
+    from gateway.cache.semantic_cache import SemanticCache
+    from gateway.schemas.openai import ChatCompletionRequest
+
+    cache = SemanticCache(ttl_seconds=60, max_size=2)
+    a, b, c = (ChatCompletionRequest(model="m", messages=[{"role": "user", "content": x}]) for x in "abc")
+    await cache.set(a, "A", "stop")
+    await cache.set(b, "B", "stop")
+    await cache.set(b, "B2", "stop")
+
+    assert (await cache.get(a) or ("",))[0] == "A", "re-storing an existing request evicts nothing"
+    assert (await cache.get(b))[0] == "B2", "the overwrite stores the new answer"
+
+    await cache.set(c, "C", "stop")
+    assert await cache.get(a) is None and await cache.get(c) is not None, "a new request in a full cache evicts the oldest"
