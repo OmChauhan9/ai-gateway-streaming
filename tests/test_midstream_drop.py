@@ -46,7 +46,7 @@ async def test_midstream_drop_interceptor_emits_error_frame():
     error_called = False
     caught_exception = None
 
-    async def on_error(exc: Exception):
+    async def on_error(exc: Exception, completion_tokens: int):
         nonlocal error_called, caught_exception
         error_called = True
         caught_exception = exc
@@ -119,7 +119,7 @@ async def _intercept_ending(ending: bytes):
     async def on_complete(telemetry):
         completed.append(telemetry)
 
-    async def on_error(exc):
+    async def on_error(exc, completion_tokens):
         errors.append(exc)
 
     async for chunk in telemetry_stream_interceptor(
@@ -422,12 +422,12 @@ async def test_stream_outcome_callbacks_complete_inside_a_cancelled_scope(client
         ttft_ms=1.0, tpot_ms=1.0, total_latency_ms=1.0, completion_tokens=3, accumulated_text="abc",
     )
 
-    for name, arg in [
-        ("on_stream_complete", telemetry),
-        ("on_stream_error", RuntimeError("upstream gone")),
-        ("on_client_disconnect", 3),
+    for name, args in [
+        ("on_stream_complete", (telemetry,)),
+        ("on_stream_error", (RuntimeError("upstream gone"), 3)),
+        ("on_client_disconnect", (3,)),
     ]:
         with anyio.CancelScope() as scope:
             scope.cancel()
-            await callbacks[name](arg)
+            await callbacks[name](*args)
         assert not scope.cancelled_caught, f"{name} never suspends, so a client disconnect cannot cut it short"
