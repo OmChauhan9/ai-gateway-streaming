@@ -279,8 +279,14 @@ def _requests_total(metrics_text: str, status: str) -> float:
     return float(match.group(1)) if match else 0.0
 
 
+def _tokens_total(metrics_text: str, kind: str) -> float:
+    labels = f'model="llama3-8b",provider="mock-groq-primary",type="{kind}"'
+    match = re.search(rf"^llm_tokens_total\{{{labels}\}} (\S+)$", metrics_text, re.MULTILINE)
+    return float(match.group(1)) if match else 0.0
+
+
 @pytest.mark.asyncio
-async def test_midstream_failure_charges_the_tokens_already_streamed(client, gateway_app):
+async def test_midstream_failure_charges_and_counts_the_tokens_already_streamed(client, gateway_app):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
     from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens
@@ -312,7 +318,11 @@ async def test_midstream_failure_charges_the_tokens_already_streamed(client, gat
     assert bucket["level"] == pytest.approx(prompt_tokens + 2), "the two streamed completion tokens are charged"
     outcomes = {code: _requests_total(after, code) - _requests_total(before, code) for code in ("200", "499", "502")}
     assert outcomes == {"200": 0, "499": 0, "502": 1}, "the stream is counted once, as a 502"
-    assert len([s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]) == 1, "the span is ended once"
+    counted = {kind: _tokens_total(after, kind) - _tokens_total(before, kind) for kind in ("prompt", "completion")}
+    assert counted == {"prompt": prompt_tokens, "completion": 2}, "the token counter matches what the limiter charged"
+    ended = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    assert len(ended) == 1, "the span is ended once"
+    assert ended[0].attributes["gen_ai.usage.completion_tokens"] == 2, "the span carries the streamed completion count"
     spans.shutdown()
 
 
