@@ -36,7 +36,8 @@ class PrometheusMetricsRegistry:
         self.requests_total = Counter(
             "llm_requests_total",
             "Chat completion responses by the HTTP status the client received. A stream that fails after "
-            "its headers counts as 502, the code in its error event. Cache hits and requests rejected "
+            "its headers counts as 502, the code in its error event, and a client that disconnects mid-stream "
+            "counts as 499. Cache hits and requests rejected "
             "before the handler (400, 422) are not counted.",
             ["provider", "model", "status", "stream"],
             registry=self.registry,

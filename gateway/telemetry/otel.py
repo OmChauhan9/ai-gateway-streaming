@@ -1,6 +1,8 @@
 """OpenTelemetry span for each chat completion request.
 
-Each request gets one SERVER span named `chat <model>`. The gateway sets these attributes on it:
+Each request that reaches provider selection gets one SERVER span named `chat <model>`. Cache hits, and
+requests rejected before that (400, 413, 422, 429, or a 503 because every breaker is open), get none.
+The gateway sets these attributes on the span:
 - gen_ai.system is the provider name. After a failover, gateway/main.py sets it to the fallback's name.
 - gen_ai.request.model is the model name from the request.
 - gen_ai.request.streaming is the request's stream flag.
@@ -12,7 +14,7 @@ Each request gets one SERVER span named `chat <model>`. The gateway sets these a
 - error.message, set with an ERROR status when the request fails.
 
 Some of these names differ from the OpenTelemetry GenAI conventions at
-https://opentelemetry.io/docs/specs/semconv/gen-ai/. gen_ai.system, gen_ai.usage.prompt_tokens, and
+https://github.com/open-telemetry/semantic-conventions-genai. gen_ai.system, gen_ai.usage.prompt_tokens, and
 gen_ai.usage.completion_tokens are deprecated. gen_ai.request.streaming, gen_ai.server.ttft, and
 gen_ai.server.tpot are custom. The gateway configures no span exporter. The Limitations section of
 README.md lists these gaps.

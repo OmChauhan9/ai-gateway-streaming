@@ -102,7 +102,7 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
 - Otherwise the limiter loads or creates the bucket `BucketState(level, last_leak_time)` and drains it: `level = max(0, level - leak_rate * (now - last_leak_time))`.
 - If `level + tokens <= capacity`, the level rises by `tokens` and the request goes on.
 - If not, `retry_after = max(0.01, overflow / leak_rate)`, where `overflow = level + tokens - capacity`. The gateway increments `llm_rate_limit_exceeded_total` and returns 429.
-- The gateway adjusts the charge only after a stream that completes, a client disconnect (stage 10), or a non-streaming success (see Non-streaming requests). A cache hit, a relayed 4xx, a 502, a 503, or a mid-stream failure keeps the full prompt charge.
+- The gateway adjusts the charge only after a stream that completes, a client disconnect (stage 10), a mid-stream failure, or a non-streaming success (see Non-streaming requests). After a mid-stream failure it adds the content events streamed before the failure. A cache hit, a relayed 4xx, a 502, or a 503 keeps the full prompt charge.
 
 #### Stage 5: exact cache lookup
 - The cache is exact-match only. There is no semantic matching.
@@ -163,7 +163,7 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
   data: [DONE]
   ```
 
-  There is no failover, no limiter reconcile, and no cache set. `llm_requests_total` counts the request with status `502`.
+  There is no failover and no cache set. The limiter is charged for the content events streamed before the failure, and `llm_requests_total` counts the request with status `502`.
 - If the client disconnects, `on_client_disconnect` records `llm_requests_total{status="499"}` with the content events counted so far. It sets `gateway.client_disconnected` on the span and ends it, and reconciles the limiter. The permit is abandoned, so the breaker records no outcome.
 
 #### Stage 10: after a complete stream
@@ -172,7 +172,7 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
   1. `permit.succeed()`. In HALF-OPEN, this counts one probe success. The breaker closes after `CB_HALF_OPEN_SUCCESS_THRESHOLD` probe successes, one probe at a time.
   2. `record_request_metrics(...)` increments `llm_requests_total{provider, model, status="200", stream="true"}`. It observes `llm_ttft_seconds` and `llm_tpot_seconds` when they are above 0. It adds the prompt estimate and the completion count to `llm_tokens_total` and observes `llm_gateway_latency_seconds`.
   3. `record_completion_telemetry(...)` sets `gen_ai.server.ttft` and `gen_ai.server.tpot` (in ms), `gen_ai.usage.completion_tokens`, `gateway.fallback_used`, and `gateway.cached`. It sets status OK and ends the span.
-  4. `release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)` adds the completion count to the bucket level, capped at the capacity. The prompt side stays an estimate.
+  4. `release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)` adds the completion count to the bucket level. The level can go above the capacity, and later requests wait until it drains. The prompt side stays an estimate.
   5. If the stream carried any content, `cache.set(...)` stores the text, the stream's `finish_reason`, and a `usage` built from the estimate and the count. When the cache is full, it evicts the entry that was inserted first.
 - `llm_requests_total` gets one sample for every response the chat handler sends, under the HTTP status the client received. A stream that fails after its headers counts as `502`, and a client disconnect as `499`. A rejection with no provider involved (413, 429, or every breaker open) uses `provider="none"`. Cache hits and the 400 and 422 rejections add nothing.
 - Prometheus metrics are pull-only, scraped at `GET /metrics`.
@@ -403,7 +403,7 @@ sequenceDiagram
     GW->>Tel: end the span with status ERROR
     GW-->>Client: event error, type upstream_connection_broken, code 502, provider groq
     GW-->>Client: data [DONE]
-    Note over GW: no failover, no limiter reconcile and no cache set. llm_requests_total counts status 502
+    Note over GW: no failover and no cache set. The limiter is charged for the content already streamed. llm_requests_total counts status 502
 ```
 
 The error event after a dropped connection, from an in-process run against the mock upstream:
