@@ -280,6 +280,43 @@ def _requests_total(metrics_text: str, status: str) -> float:
 
 
 @pytest.mark.asyncio
+async def test_midstream_failure_charges_the_tokens_already_streamed(client, gateway_app):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens
+    from gateway.schemas.openai import ChatMessage
+
+    ctx = gateway_app.state.ctx
+    ctx.limiter.leak_rate = 1e-9
+    spans = InMemorySpanExporter()
+    ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=gateway_app.state.primary_mock_app), base_url="http://primary"
+    ) as admin:
+        await admin.post(
+            "/admin/fault-injection",
+            json={"fail_midstream": True, "added_ttft_delay_ms": 0, "added_tpot_delay_ms": 0},
+        )
+    messages = [{"role": "user", "content": "Drop after a few tokens"}]
+    auth = {"Authorization": "Bearer midstream-client"}
+    before = (await client.get("/metrics")).text
+    resp = await client.post(
+        "/v1/chat/completions", json={"model": "llama3-8b", "messages": messages, "stream": True}, headers=auth
+    )
+    after = (await client.get("/metrics")).text
+
+    assert resp.text.count('"content"') == 2, "the mock drops after its second token"
+    assert "upstream_connection_broken" in resp.text, "the drop reaches the client as an error frame"
+    prompt_tokens = estimate_prompt_tokens([ChatMessage(**m) for m in messages])
+    bucket = (await client.get("/v1/rate-limiter/status", headers=auth)).json()["bucket"]
+    assert bucket["level"] == pytest.approx(prompt_tokens + 2), "the two streamed completion tokens are charged"
+    outcomes = {code: _requests_total(after, code) - _requests_total(before, code) for code in ("200", "499", "502")}
+    assert outcomes == {"200": 0, "499": 0, "502": 1}, "the stream is counted once, as a 502"
+    assert len([s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]) == 1, "the span is ended once"
+    spans.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_client_disconnect_mid_stream_is_counted_and_reconciled(client, gateway_app):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
