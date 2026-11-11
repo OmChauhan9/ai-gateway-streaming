@@ -506,7 +506,7 @@ A permit settles as one of three outcomes:
 | Variable | Default | What it does |
 | :--- | :--- | :--- |
 | `APP_NAME` | `"Async AI Gateway"` | The FastAPI title, also returned by `GET /health`. |
-| `HOST` | `"0.0.0.0"` | Bind address. Only `scripts/run_gateway.py` reads it. |
+| `HOST` | `"127.0.0.1"` | Bind address. Only `scripts/run_gateway.py` reads it. Set `0.0.0.0` to listen on all interfaces; the admin endpoints have no authentication. |
 | `PORT` | `8000` | Bind port. Only `scripts/run_gateway.py` reads it. |
 | `DEBUG` | `false` | Passed as uvicorn's `reload=` in `scripts/run_gateway.py`. It does nothing else. |
 | `PRIMARY_PROVIDER_NAME` | `"groq"` | Name of the primary provider, used in headers, metrics, and breaker routes. |
