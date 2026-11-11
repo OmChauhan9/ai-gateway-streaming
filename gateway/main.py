@@ -533,8 +533,9 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
             permit.succeed()
 
             total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
-            usage = data.get("usage", {})
-            comp_tokens = usage.get("completion_tokens", 0)
+            # Providers may send `"usage": null`, or null counts inside it.
+            usage = data.get("usage") or {}
+            comp_tokens = usage.get("completion_tokens") or 0
 
             ctx.metrics.record_request_metrics(
                 provider=active_provider.name,
