@@ -114,6 +114,35 @@ async def test_cleanup_prunes_buckets_that_drained_and_went_idle(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_completion_tokens_beyond_capacity_are_owed_until_they_drain():
+    limiter = TokenLeakyBucketLimiter(capacity_tokens=1000, leak_rate_tokens_per_second=100.0)
+    await limiter.acquire("debtor", 10)
+    await limiter.release_or_adjust("debtor", 10, 5010)
+
+    with pytest.raises(RateLimitExceeded) as exc_info:
+        await limiter.acquire("debtor", 10)
+
+    # 5010 + 10 - 1000 = 4020 tokens over capacity, at 100 tokens/s
+    assert 40.1 <= exc_info.value.retry_after <= 40.25, "the wait covers the whole debt, not only the capacity"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_keeps_a_bucket_that_is_still_in_debt(monkeypatch):
+    limiter = TokenLeakyBucketLimiter(
+        capacity_tokens=1000, leak_rate_tokens_per_second=0.5, cleanup_interval_seconds=0
+    )
+    await limiter.acquire("debtor", 10)
+    await limiter.release_or_adjust("debtor", 10, 10010)
+
+    two_hours_later = leaky_bucket.time.monotonic() + 7200
+    monkeypatch.setattr(leaky_bucket, "time", SimpleNamespace(monotonic=lambda: two_hours_later))
+    await limiter.acquire("active", 5)
+
+    with pytest.raises(RateLimitExceeded):
+        await limiter.acquire("debtor", 10)
+
+
+@pytest.mark.asyncio
 async def test_gateway_429_endpoint_rejection(client):
     ctx = client._transport.app.state.ctx
     ctx.limiter = TokenLeakyBucketLimiter(capacity_tokens=50, leak_rate_tokens_per_second=10.0)
