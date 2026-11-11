@@ -209,7 +209,7 @@ When a request that needs $T_{\text{req}}$ tokens arrives at time $t$, the limit
    $$\text{Retry-After} = \lfloor \text{retry\_after} \rfloor + 1$$
    In a run with $C = 100$ and $r = 10$, the body said `6.7` and the header said `7`.
 
-5. **Reconciliation.** Admission charges only the prompt estimate. After a successful response or a client disconnect, `release_or_adjust` adds the completion tokens and clamps the level to the range $[0, C]$. The level can therefore reach $C$ after a request that admission allowed. For a stream, the completion count is the number of content events (section 2). For a non-streaming response, it is the provider's `usage.completion_tokens`.
+5. **Reconciliation.** Admission charges only the prompt estimate. After a successful response, a client disconnect, or a mid-stream failure, `release_or_adjust` adds the completion tokens and keeps the level at or above 0. The level can go above $C$. Later requests then wait until it drains far enough to admit them. After a mid-stream failure, the completion count is the content events streamed before the failure. For a stream, the completion count is the number of content events (section 2). For a non-streaming response, it is the provider's `usage.completion_tokens`.
 
 The limiter runs before the cache lookup. A cache hit is charged its prompt estimate like any other request, and nothing reconciles that charge.
 
@@ -304,7 +304,7 @@ The upstream client in `gateway/upstream/client.py` sorts each outcome into an e
 
 | Upstream outcome | Breaker records | What the client gets |
 | :--- | :--- | :--- |
-| Connection error or timeout before headers (connect timeout 5 s, overall timeout 30 s) | failure | failover |
+| Connection error or timeout before headers (connect timeout 5 s, then 30 s for each read, write, or pool wait, with no deadline for the whole request) | failure | failover |
 | HTTP 5xx | failure | failover |
 | HTTP 429 | failure | failover |
 | HTTP 401 or 403 | failure | failover, or 502 `upstream_auth_failed` when it is the last failure |

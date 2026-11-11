@@ -1,16 +1,17 @@
 """Async AI Gateway with Streaming Telemetry & Circuit Breaking.
 
-Production-grade inference proxy providing:
+A proxy for OpenAI-style chat completion requests, with:
 1. Token Leaky-Bucket Rate Limiter (prompt token estimation + reconciliation)
-2. Semantic / Exact Cache Check (instant hit delivery)
-3. Tri-State Circuit Breakers with Transparent Multi-Provider Failover
-4. Non-Blocking SSE Streaming Interceptor (real-time TTFT & TPOT profiling)
-5. OpenTelemetry GenAI Semantic Conventions & Prometheus Observability
+2. Exact-match response cache
+3. Tri-State Circuit Breakers with failover from the primary to one fallback provider
+4. SSE streaming interceptor that measures TTFT and TPOT
+5. OpenTelemetry spans with gen_ai.* attributes, and Prometheus metrics
 """
 
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import math
 import time
 import uuid
 from typing import AsyncIterator, Optional
@@ -287,7 +288,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     headers=headers,
                 )
 
-        # 2. Semantic / Exact Cache Check
+        # 2. Exact cache check
         cached_result = await ctx.cache.get(payload)
         if cached_result:
             response_text, finish_reason, usage_info = cached_result
@@ -421,7 +422,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                         usage={"prompt_tokens": prompt_tokens, "completion_tokens": telemetry.completion_tokens, "total_tokens": actual_total},
                     )
 
-            async def on_stream_error(exc: Exception):
+            async def on_stream_error(exc: Exception, completion_tokens: int):
                 # Mid-stream error
                 permit.fail()
                 ctx.metrics.record_request_metrics(
@@ -443,6 +444,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     fallback_used=fallback_diverted,
                     error=str(exc),
                 )
+                await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + completion_tokens)
 
             async def on_client_disconnect(completion_tokens: int):
                 # Says nothing about provider health, so the circuit breaker records no outcome.
@@ -534,8 +536,14 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
             total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
             # Providers may send `"usage": null`, or null counts inside it.
-            usage = data.get("usage") or {}
-            comp_tokens = usage.get("completion_tokens") or 0
+            usage = data.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            comp_tokens = usage.get("completion_tokens")
+            # JSON allows 7.0 for a count; anything that is not a finite number counts as 0.
+            if isinstance(comp_tokens, bool) or not isinstance(comp_tokens, (int, float)) or not math.isfinite(comp_tokens):
+                comp_tokens = 0
+            comp_tokens = int(round(comp_tokens))
 
             ctx.metrics.record_request_metrics(
                 provider=active_provider.name,
@@ -560,9 +568,10 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
             await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + comp_tokens)
 
-            choices = data.get("choices", [])
-            content_text = choices[0]["message"]["content"] if choices else ""
-            if content_text:
+            choices = data["choices"]
+            content_text = choices[0]["message"].get("content") if choices else ""
+            # Only text is cached: a streamed hit replays it as `delta.content`, which clients expect to be a string.
+            if isinstance(content_text, str) and content_text:
                 await ctx.cache.set(payload, content_text, choices[0].get("finish_reason"), usage)
 
             headers = {
@@ -634,7 +643,7 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
     @app.post("/v1/cache/clear")
     async def clear_cache():
-        """Purge semantic/exact cache."""
+        """Empty the exact-match response cache."""
         ctx.cache.clear()
         return {"status": "cache_cleared"}
 

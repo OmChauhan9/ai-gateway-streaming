@@ -1,7 +1,6 @@
 """Gateway configuration module using Pydantic Settings.
 
-Supports environment variable overrides for multi-environment deployments
-(Local Dev, Docker, Kubernetes, Production).
+Environment variables and a `.env` file override the defaults below.
 """
 
 from functools import lru_cache
@@ -59,7 +58,7 @@ class Settings(BaseSettings):
     # Circuit Breaker Parameters (Nygard pattern)
     cb_failure_threshold: int = Field(
         default=5,
-        description="Number of consecutive failures (5xx, 429, timeout) before tripping OPEN",
+        description="Provider failures within cb_failure_window_seconds that trip CLOSED to OPEN. A success does not reset the count",
     )
     cb_failure_window_seconds: float = Field(
         default=10.0,
@@ -85,7 +84,7 @@ class Settings(BaseSettings):
         description="Leak rate in tokens per second (steady-state rate)",
     )
 
-    # Semantic / Exact Cache
+    # Exact-match response cache
     cache_enabled: bool = True
     cache_ttl_seconds: int = 300
     cache_max_size: int = 1000

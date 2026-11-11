@@ -74,9 +74,11 @@ All numbers come from the scripts in `benchmarks/`, run against the bundled mock
 
 The numbers below come from an Apple M3 Pro with 11 logical CPUs and 18 GiB of memory, on macOS 26.5.2, with CPython 3.13.14, fastapi 0.162.4, httpx 0.28.1, and uvicorn 0.54.0, at commit c29a4d2. The 1-minute load average was between 2.6 and 3.0 during the runs.
 
-### Added latency is under 1 ms with an instant upstream, and grows when the upstream is slow
+### The median added latency is under 1 ms with an instant upstream, and grows when the upstream is slow
 
 Each pair sends the same streaming request once straight to the mock and once through the gateway, and alternates which one goes first. The overhead of a pair is the gateway time minus the direct time. The script keeps negative differences. Pairs run one at a time, so these numbers describe latency with no concurrent load.
+
+The table shows the `overhead, full stream` row from the script's "Pooled over all runs" block. "5 × 200" means 5 runs of 200 pairs each, which is the script's default, after 20 warm-up pairs. The script also prints each run separately and a `first chunk` row, which times only the first chunk of the stream.
 
 | Setup | Pairs | Overhead p50 | p90 | p99 |
 | :--- | ---: | ---: | ---: | ---: |
@@ -98,13 +100,15 @@ This benchmark runs in-process against two mocks. During the outage phase, the p
 | Primary outage (503) | 25 | all at once | 25 | 0 | 25 |
 | After recovery | 15 | one at a time | 15 | 15 | 0 |
 
-All 50 requests got HTTP 200 and a stream that ended normally, with no error events. The primary's breaker went from CLOSED to OPEN at 2.06 s, to HALF-OPEN at 2.88 s, and back to CLOSED at 3.29 s.
+All 50 requests got HTTP 200 and a stream that ended normally, with no error events. The primary's breaker went from CLOSED to OPEN at 2.06 s, to HALF-OPEN at 2.88 s, and back to CLOSED at 3.29 s. These times count from the start of the run, so they include about 2 s of normal traffic before the outage. The benchmark shortens the breaker's cooldown to 0.5 s (the default is 15 s), and the breaker moves to HALF-OPEN the first time anything reads its state after the cooldown, such as a request or a status call, not the moment the cooldown ends. During the outage, requests took 245 ms at the median, against 202 ms before it.
 
 This run covers failures that happen before the response starts. It does not cover mid-stream failures, real providers, or real network faults.
 
 ---
 
 ## Quickstart
+
+The quickstart, the tests, and the benchmarks need no paid service and no API key. The bundled mock stands in for the model provider, and nothing calls an outside service. If you point the gateway at a hosted provider, that provider bills your own key. A local OpenAI-compatible server, such as Ollama or vLLM, costs nothing.
 
 ### 1. Install
 ```bash
@@ -116,6 +120,7 @@ uv venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
+These commands use [uv](https://docs.astral.sh/uv/). Without uv, run `python3 -m venv .venv` and then `.venv/bin/pip install -e ".[dev]"`. The project needs Python 3.11 or later, so check `python3 --version` first. An older Python makes pip fail with a `setup.py` not found error that does not mention the version.
 
 ### 2. Start the mock upstreams
 The mock streams canned tokens and supports fault injection. It runs the primary on `:8001` and the fallback on `:8002`.
@@ -128,12 +133,38 @@ In a separate terminal, run:
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/run_gateway.py
 ```
-The gateway listens on `http://127.0.0.1:8000`. To use real providers, set `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `FALLBACK_BASE_URL`, and `FALLBACK_API_KEY`. See `.env.example` and `config/settings.py` for every setting.
+The gateway listens on `http://127.0.0.1:8000`. Set `HOST=0.0.0.0` to listen on every network interface, but note that the admin endpoints have no authentication. To use real providers, set `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `FALLBACK_BASE_URL`, and `FALLBACK_API_KEY`. A base URL must include the provider's `/v1` part, because the gateway appends `/chat/completions` to it. See `.env.example` and `config/settings.py` for every setting.
 
 ### 4. Stream from the demo client
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/demo_client.py --prompt "How does an async AI gateway manage inference reliability?"
 ```
+If you send the same prompt again within 5 minutes, the cache answers it. The demo then reports no provider, and the whole answer arrives as one event. Change the prompt to reach the mock again. The demo's TTFT is far above the gateway's added latency because it includes the mock's 30 ms delay before the first token and a new connection.
+
+### 5. Run a failover drill
+The cache answers a repeated request without calling any provider, so a repeat shows `X-Cache: HIT` and no provider headers. Empty the cache first, and send a different message each time:
+```bash
+curl -X POST http://127.0.0.1:8000/v1/cache/clear
+curl -X POST http://127.0.0.1:8000/v1/circuit-breakers/groq/trip
+curl -i -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3-8b", "messages": [{"role": "user", "content": "Failover drill"}]}'
+```
+The response headers show `X-Gateway-Provider: together` and `X-Gateway-Fallback: true`. The trip lasts one cooldown, 15 s by default. After that, the next request tests the primary, and two successful tests close the breaker. `POST /v1/circuit-breakers/groq/reset` closes it at once.
+
+To make the primary fail for real, inject a fault into its mock, send six requests with different messages, and look at the breakers:
+```bash
+curl -X POST http://127.0.0.1:8000/v1/circuit-breakers/groq/reset
+curl -X POST http://127.0.0.1:8001/admin/fault-injection -H "Content-Type: application/json" -d '{"fail_with_status": 503}'
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -D - -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "{\"model\": \"llama3-8b\", \"messages\": [{\"role\": \"user\", \"content\": \"fault drill $i\"}]}" | grep -i x-gateway-provider
+done
+curl http://127.0.0.1:8000/v1/circuit-breakers
+curl -X POST http://127.0.0.1:8001/admin/reset
+```
+Every request gets a 200 from `together`. After 5 failures within 10 s, the primary's breaker is OPEN, and the gateway stops trying the primary until the cooldown ends. The last command removes the fault.
 
 ---
 
@@ -148,7 +179,7 @@ PYTHONPATH=. .venv/bin/python scripts/demo_client.py --prompt "How does an async
 ```bash
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode inprocess
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode loopback
-# With the mock's default delays, as in the third table row:
+# With the mock's default delays, as in the third table row (takes about 2 minutes):
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_overhead.py --mode loopback --ttft-ms 30 --tpot-ms 10 --iterations 150 --runs 2
 ```
 
@@ -174,7 +205,7 @@ Locust's own timing of the POST stops at the response headers. The `stream:ttft`
 The OpenAI-compatible chat completion endpoint, also served at `/chat/completions`. It accepts streaming and non-streaming requests with text content.
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+curl -i -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer my-api-key" \
   -d '{
@@ -192,7 +223,7 @@ Response headers:
 - `X-Gateway-Fallback`, `true` if the fallback served it.
 - `X-Cache`, either `MISS` or `HIT`. The gateway sends it only while the cache is enabled. A cache hit carries no provider header and no fallback header.
 
-Errors use the OpenAI shape, `{"error": {"message": ..., "type": ...}}`, except for 422.
+Errors from this endpoint use the OpenAI shape, `{"error": {"message": ..., "type": ...}}`, except for 422. The admin endpoints return FastAPI's `{"detail": ...}` shape, for example a 404 for an unknown provider name.
 
 | Status | Meaning |
 | :--- | :--- |
@@ -211,8 +242,10 @@ Prometheus exposition. Some of the series:
 - `llm_requests_total{provider="groq",model="llama3-70b-8192",status="200",stream="true"}`
 - `circuit_breaker_state{provider="groq"}`, where 0 is CLOSED, 1 is HALF-OPEN, and 2 is OPEN.
 
+The other series are `llm_gateway_latency_seconds`, `llm_tokens_total`, `circuit_breaker_trips_total`, `llm_rate_limit_exceeded_total`, and `llm_cache_hits_total`. Prometheus may print the labels in a different order.
+
 ### `GET /health`
-Returns the gateway status and every breaker's state. The status is `healthy` while at least one provider's breaker is not OPEN.
+Returns the gateway status and every breaker's state. The status is `healthy` while at least one provider's breaker is not OPEN, and `degraded` when every breaker is OPEN. Both come with HTTP 200.
 
 ### Admin endpoints
 These endpoints have no authentication.
@@ -222,14 +255,27 @@ These endpoints have no authentication.
 - `GET /v1/rate-limiter/status` returns the caller's bucket level.
 - `POST /v1/cache/clear` empties the cache.
 
+### Defaults
+Every setting can be changed with an environment variable or a `.env` file. See `.env.example` and `config/settings.py`.
+
+| Setting | Default |
+| :--- | :--- |
+| Token bucket per client key | 50,000 tokens, draining at 2,000 tokens per second |
+| Breaker trips after | 5 failures within 10 s |
+| Breaker cooldown before a test request | 15 s |
+| Successful test requests to close the breaker | 2 |
+| Cache | on, 1,000 entries, each kept for 300 s |
+| Upstream timeout | 5 s to connect, then 30 s for each read or write |
+
 ---
 
 ## Limitations
 
 - **No client authentication.** The gateway does not check who a client is. A client that changes its bearer string gets a fresh rate-limit bucket. Anyone who can reach the gateway can call the admin endpoints, which can trip breakers and clear the cache. CORS allows any origin, with credentials.
 - **State lives in one process.** Breakers, rate-limit buckets, and the cache are in memory. Each worker or replica has its own copy, and a restart clears them.
-- **The cache matches exact requests only.** Any change to the messages or the generation parameters is a miss. The gateway skips the cache for `n > 1` and for request fields it does not model. A streamed hit arrives as a single SSE event. Cache hits create no span, so the `gateway.cached` span attribute is always false.
-- **Token counts are estimates.** The prompt estimate is the character count divided by 4, plus a fixed amount for each message, not a tokenizer's count. On streams, the completion count is the number of content-bearing SSE events.
+- **The cache matches exact requests only.** Any change to the messages or the generation parameters is a miss, with three exceptions. The key ignores whitespace at the start and end of each message's text when that text is a plain string. It ignores the `stream` flag, so a streaming request can hit an answer cached from a non-streaming one. It ignores the `user` field, so all clients share one cache. The gateway skips the cache for `n > 1` and for request fields it does not model. A streamed hit arrives as a single SSE event. Cache hits create no span, so the `gateway.cached` span attribute is always false.
+- **Token counts are estimates.** The prompt estimate is the character count divided by 4, rounded up, for each message's role, content, and name, plus 1 more for a message with a name, 3 per message, and 3 per request. Request fields the gateway does not model, such as `tools`, add their JSON length divided by 4. It is not a tokenizer's count. On streams, the completion count is the number of content-bearing SSE events.
+- **The breaker reacts only to errors.** A provider that answers 200 quickly and then stalls before its first token counts as healthy, as long as each stall is shorter than the read timeout (30 s by default).
 - **Failover is one hop, and happens only before the first byte.** There is one fallback. The gateway tries it once and does not retry with backoff. A failure after the stream starts ends in an error event.
 - **The OpenTelemetry names are not current.** `gen_ai.system`, `gen_ai.usage.prompt_tokens`, and `gen_ai.usage.completion_tokens` are deprecated. Their replacements are `gen_ai.provider.name`, `gen_ai.usage.input_tokens`, and `gen_ai.usage.output_tokens`. `gen_ai.request.streaming`, `gen_ai.server.ttft`, and `gen_ai.server.tpot` are custom names. The gateway configures no span exporter, so the host application must set one up.
 - **Only the mock is tested.** No test or benchmark in this repository runs against a real provider.

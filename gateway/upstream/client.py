@@ -1,7 +1,7 @@
 """Async HTTP Client for Upstream LLM Providers.
 
-Configured with high-performance connection pooling, keep-alives, and timeouts.
-Dispatches requests to upstream endpoints and normalizes network/protocol errors.
+Holds one pooled httpx.AsyncClient, sends chat completion requests to the providers, and turns
+network and HTTP errors into the Upstream*Error classes below.
 """
 
 from typing import Any, AsyncIterator, Dict, Optional
@@ -49,7 +49,7 @@ class UpstreamClientError(UpstreamException):
 
 
 class AsyncUpstreamClient:
-    """Production async HTTP client managing connections to upstream providers."""
+    """Async HTTP client for the upstream providers, with one shared connection pool."""
 
     def __init__(
         self,
@@ -170,6 +170,12 @@ class AsyncUpstreamClient:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError as exc:
             raise UpstreamServerError(provider.name, resp.status_code, f"Malformed JSON body: {exc}") from exc
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not all(
+            isinstance(choice, dict) and isinstance(choice.get("message"), dict) for choice in choices
+        ):
+            raise UpstreamServerError(provider.name, resp.status_code, "Reply has no list of choices with messages")
+        return data
