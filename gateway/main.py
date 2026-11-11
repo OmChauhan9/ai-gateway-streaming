@@ -534,8 +534,12 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
             total_duration_ms = (time.perf_counter() - req_start_time) * 1000.0
             # Providers may send `"usage": null`, or null counts inside it.
-            usage = data.get("usage") or {}
-            comp_tokens = usage.get("completion_tokens") or 0
+            usage = data.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            comp_tokens = usage.get("completion_tokens")
+            if not isinstance(comp_tokens, int):
+                comp_tokens = 0
 
             ctx.metrics.record_request_metrics(
                 provider=active_provider.name,
@@ -560,8 +564,8 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
 
             await ctx.limiter.release_or_adjust(client_key, prompt_tokens, prompt_tokens + comp_tokens)
 
-            choices = data.get("choices", [])
-            content_text = choices[0]["message"]["content"] if choices else ""
+            choices = data["choices"]
+            content_text = choices[0]["message"].get("content") if choices else ""
             if content_text:
                 await ctx.cache.set(payload, content_text, choices[0].get("finish_reason"), usage)
 

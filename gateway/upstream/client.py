@@ -170,6 +170,12 @@ class AsyncUpstreamClient:
                 raise UpstreamClientError(provider.name, resp.status_code, body_text)
 
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError as exc:
             raise UpstreamServerError(provider.name, resp.status_code, f"Malformed JSON body: {exc}") from exc
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not all(
+            isinstance(choice, dict) and isinstance(choice.get("message"), dict) for choice in choices
+        ):
+            raise UpstreamServerError(provider.name, resp.status_code, "Reply has no list of choices with messages")
+        return data
