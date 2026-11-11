@@ -384,3 +384,41 @@ async def test_stream_that_fails_after_headers_is_counted_as_502(test_settings):
     assert increments == {_series("count-dropped", PRIMARY, "502", True): 1.0}, (
         "the failed stream is counted once, as a 502 and not a 200"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "usage",
+    [None, {"prompt_tokens": 5, "completion_tokens": None, "total_tokens": None}],
+    ids=["usage-null", "completion-tokens-null"],
+)
+async def test_non_streaming_reply_with_null_usage_is_served_and_traced(test_settings, usage):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.trace import StatusCode
+
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    reply = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}], "usage": usage}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=reply)
+
+    gateway = create_app(settings=test_settings, client=AsyncUpstreamClient(transport=httpx.MockTransport(upstream)))
+    spans = InMemorySpanExporter()
+    gateway.state.ctx.otel.tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    payload = {"model": "llama3-8b", "messages": [{"role": "user", "content": "null usage"}], "stream": False}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        before = _request_counts((await c.get("/metrics")).text)
+        resp = await c.post("/v1/chat/completions", json=payload)
+        after = _request_counts((await c.get("/metrics")).text)
+    finished = [s for s in spans.get_finished_spans() if s.name == "chat llama3-8b"]
+    spans.shutdown()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["message"]["content"] == "ok", "the provider's reply reaches the client"
+    assert len(finished) == 1 and finished[0].status.status_code == StatusCode.OK, "the span ends once, as a success"
+    increments = {k: v - before.get(k, 0.0) for k, v in after.items() if v != before.get(k, 0.0)}
+    assert increments == {_series("llama3-8b", PRIMARY, "200", False): 1.0}, "counted once, as a 200"
