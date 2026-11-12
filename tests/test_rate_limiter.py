@@ -1,13 +1,15 @@
 """Unit and integration tests for Token Leaky-Bucket Rate Limiter."""
 
 import asyncio
+import re
 from types import SimpleNamespace
 
+import httpx
 import pytest
-from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_text_tokens
+from gateway.limiter.tokenizer_estimator import estimate_prompt_tokens, estimate_request_tokens, estimate_text_tokens
 from gateway.limiter import leaky_bucket
 from gateway.limiter.leaky_bucket import TokenLeakyBucketLimiter, RateLimitExceeded
-from gateway.schemas.openai import ChatMessage
+from gateway.schemas.openai import ChatCompletionRequest, ChatMessage
 
 
 def test_token_estimation():
@@ -242,3 +244,129 @@ async def test_non_streaming_request_charges_upstream_completion_tokens(client):
     status = (await client.get("/v1/rate-limiter/status", headers=headers)).json()["bucket"]
     expected = estimate_prompt_tokens([ChatMessage(**m) for m in messages]) + completion_tokens
     assert status["level"] == expected, "bucket holds the prompt estimate plus upstream completion tokens"
+
+
+PRIMARY, FALLBACK = "mock-groq-primary", "mock-together-fallback"
+
+
+def _tokens_counted(metrics_text: str, model: str) -> float:
+    return sum(
+        float(value)
+        for value in re.findall(rf'^llm_tokens_total\{{model="{model}",.*\}} (\S+)$', metrics_text, re.MULTILINE)
+    )
+
+
+def _upstream(primary: int, fallback: int, stream: bool):
+    def reply(request: httpx.Request) -> httpx.Response:
+        code = fallback if ":8002" in str(request.url) else primary
+        if code != 200:
+            return httpx.Response(code, json={"error": {"message": f"upstream {code}", "type": "upstream"}})
+        if stream:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'data: {"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]}\n\n'
+                b"data: [DONE]\n\n",
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "hi"}}]})
+
+    return reply
+
+
+async def _post_and_measure(settings, primary, fallback, tripped, payload, held=0):
+    """POST once, with `held` tokens already in the client's bucket.
+
+    Returns the response, the bucket level before and after, and the llm_tokens_total it moved.
+    """
+    from gateway.main import create_app
+    from gateway.upstream.client import AsyncUpstreamClient
+
+    gateway = create_app(
+        settings=settings.model_copy(update={"cache_enabled": False}),
+        client=AsyncUpstreamClient(transport=httpx.MockTransport(_upstream(primary, fallback, payload["stream"]))),
+    )
+    ctx = gateway.state.ctx
+    ctx.limiter.leak_rate = 1e-9
+    for name in tripped:
+        breaker = ctx.registry.get_provider(name).circuit_breaker
+        breaker.recovery_timeout = 60.0
+        await breaker.trip_manually()
+    if held:
+        await ctx.limiter.acquire("charge-client", held)
+    auth = {"Authorization": "Bearer charge-client"}
+    transport = httpx.ASGITransport(app=gateway, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        level_before = (await c.get("/v1/rate-limiter/status", headers=auth)).json()["bucket"]["level"]
+        tokens_before = _tokens_counted((await c.get("/metrics")).text, payload["model"])
+        resp = await c.post("/v1/chat/completions", json=payload, headers=auth)
+        level = (await c.get("/v1/rate-limiter/status", headers=auth)).json()["bucket"]["level"]
+        tokens = _tokens_counted((await c.get("/metrics")).text, payload["model"]) - tokens_before
+    return resp, level_before, level, tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize(
+    "primary, fallback, tripped, fallback_name, http_status, error_type",
+    [
+        (200, 200, (PRIMARY, FALLBACK), FALLBACK, 503, "all_providers_unavailable"),
+        (503, 200, (FALLBACK,), FALLBACK, 503, "all_providers_unavailable"),
+        (503, 503, (), FALLBACK, 503, "all_providers_unavailable"),
+        (401, 200, (FALLBACK,), FALLBACK, 502, "upstream_auth_failed"),
+        (503, 401, (), FALLBACK, 502, "upstream_auth_failed"),
+        (200, 503, (PRIMARY,), FALLBACK, 502, "upstream_error"),
+        (200, 401, (PRIMARY,), FALLBACK, 502, "upstream_auth_failed"),
+        (503, 200, (), "", 502, "upstream_error"),
+        (401, 200, (), "", 502, "upstream_auth_failed"),
+    ],
+    ids=[
+        "all-circuits-open",
+        "primary-503-fallback-open",
+        "both-503",
+        "primary-401-fallback-open",
+        "primary-503-fallback-401",
+        "primary-open-fallback-503",
+        "primary-open-fallback-401",
+        "no-fallback-503",
+        "no-fallback-401",
+    ],
+)
+async def test_request_the_gateway_cannot_serve_costs_the_client_no_tokens(
+    test_settings, stream, primary, fallback, tripped, fallback_name, http_status, error_type
+):
+    settings = test_settings.model_copy(update={"fallback_provider_name": fallback_name})
+    payload = {"model": "charge-unserved", "messages": [{"role": "user", "content": "unserved"}], "stream": stream}
+
+    resp, level_before, level, tokens = await _post_and_measure(settings, primary, fallback, tripped, payload, held=100)
+
+    assert resp.status_code == http_status, resp.text
+    assert resp.json()["error"]["type"] == error_type
+    assert level == level_before, "the prompt charge is refunded once, leaving other charges in place"
+    assert level - level_before == tokens, "the limiter charge matches llm_tokens_total"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("primary, fallback", [(400, 200), (503, 400)], ids=["primary-400", "fallback-400"])
+async def test_relayed_client_error_keeps_the_prompt_charge(test_settings, stream, primary, fallback):
+    payload = {"model": "charge-relayed", "messages": [{"role": "user", "content": "bad request"}], "stream": stream}
+
+    resp, _, level, _ = await _post_and_measure(test_settings, primary, fallback, (), payload)
+
+    assert resp.status_code == 400, resp.text
+    assert level == estimate_request_tokens(ChatCompletionRequest(**payload)), "a client fault keeps the prompt charge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "nonstream"])
+@pytest.mark.parametrize("http_status", [413, 429])
+async def test_limiter_rejection_charges_nothing(test_settings, stream, http_status):
+    settings = test_settings.model_copy(update={"rate_limiter_capacity_tokens": 10})
+    prompt = "word " * 50 if http_status == 413 else "hi"
+    payload = {"model": "charge-limited", "messages": [{"role": "user", "content": prompt}], "stream": stream}
+
+    held = 10 if http_status == 429 else 0
+    resp, level_before, level, _ = await _post_and_measure(settings, 200, 200, (), payload, held=held)
+
+    assert resp.status_code == http_status, resp.text
+    assert level == level_before, "a request the limiter rejects adds nothing to the bucket"
