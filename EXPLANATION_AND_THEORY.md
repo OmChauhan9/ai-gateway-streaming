@@ -211,6 +211,8 @@ When a request that needs $T_{\text{req}}$ tokens arrives at time $t$, the limit
 
 5. **Reconciliation.** Admission charges only the prompt estimate. After a successful response, a client disconnect, or a mid-stream failure, `release_or_adjust` adds the completion tokens and keeps the level at or above 0. The level can go above $C$. Later requests then wait until it drains far enough to admit them. After a mid-stream failure, the completion count is the content events streamed before the failure. For a stream, the completion count is the number of content events (section 2). For a non-streaming response, it is the provider's `usage.completion_tokens`.
 
+When the gateway answers 502 or 503, no provider served the request, so `release_or_adjust` refunds the whole prompt estimate and the request costs the client nothing. LiteLLM's proxy also refunds its upfront token reservation when a call fails. A provider 4xx that the gateway relays keeps the prompt charge, because the fault is the client's. The gateway has no separate limit on requests, so that charge is what slows a client that keeps sending bad requests. OpenAI and Azure OpenAI also count failed requests toward their rate limits.
+
 The limiter runs before the cache lookup. A cache hit is charged its prompt estimate like any other request, and nothing reconciles that charge.
 
 This is the meter form of the leaky bucket. The bucket is a counter beside the traffic, and the limiter admits or refuses each request without queueing it.
@@ -369,7 +371,7 @@ Histograms:
 
 Counters:
 - `llm_requests_total`, labelled `provider`, `model`, `status`, and `stream`. Every response the chat handler sends adds one sample, under the HTTP status the client received. A stream that fails after its headers counts as `502`, and a client disconnect as `499`. A rejection with no provider involved (413, 429, or every breaker open) uses `provider="none"`. Cache hits, and the 400 and 422 rejections that happen before the handler, add nothing.
-- `llm_tokens_total`, labelled `provider`, `model`, and `type`, where `type` is `prompt` or `completion`. Prompt tokens are the estimate. Completion tokens are content events for a stream and the provider's `usage.completion_tokens` otherwise. The gateway records them with each `llm_requests_total` sample. A stream that fails after its headers records the prompt estimate and the content events already streamed, as a client disconnect does. Other failure samples add 0 tokens, though the limiter keeps the prompt charge for most of them.
+- `llm_tokens_total`, labelled `provider`, `model`, and `type`, where `type` is `prompt` or `completion`. Prompt tokens are the estimate. Completion tokens are content events for a stream and the provider's `usage.completion_tokens` otherwise. The gateway records them with each `llm_requests_total` sample. A stream that fails after its headers records the prompt estimate and the content events already streamed, as a client disconnect does. Other failure samples add 0 tokens. For a 413, 429, 502, or 503 the limiter charges nothing either, so the two agree. For a relayed 4xx the limiter keeps the prompt charge.
 - `circuit_breaker_trips_total`, labelled `provider`. It counts every change into OPEN, manual trips included.
 - `llm_rate_limit_exceeded_total`, with no labels. It counts 429 responses from the limiter. A 413 does not count.
 - `llm_cache_hits_total`, labelled `cache_type`, which is always `exact`.

@@ -102,7 +102,7 @@ All error bodies except the 422 use the OpenAI shape, with `error` at the top le
 - Otherwise the limiter loads or creates the bucket `BucketState(level, last_leak_time)` and drains it: `level = max(0, level - leak_rate * (now - last_leak_time))`.
 - If `level + tokens <= capacity`, the level rises by `tokens` and the request goes on.
 - If not, `retry_after = max(0.01, overflow / leak_rate)`, where `overflow = level + tokens - capacity`. The gateway increments `llm_rate_limit_exceeded_total` and returns 429.
-- The gateway adjusts the charge only after a stream that completes, a client disconnect (stage 10), a mid-stream failure, or a non-streaming success (see Non-streaming requests). After a mid-stream failure it adds the content events streamed before the failure. A cache hit, a relayed 4xx, a 502, or a 503 keeps the full prompt charge.
+- The gateway adjusts the charge only after a stream that completes, a client disconnect (stage 10), a mid-stream failure, a non-streaming success (see Non-streaming requests), or a 502 or 503. After a mid-stream failure it adds the content events streamed before the failure. A 502 or 503 means no provider served the request, so the gateway refunds the whole prompt charge and the request costs the client nothing. A cache hit or a relayed 4xx keeps the full prompt charge.
 
 #### Stage 5: exact cache lookup
 - The cache is exact-match only. There is no semantic matching.
