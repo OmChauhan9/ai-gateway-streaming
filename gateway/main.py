@@ -288,6 +288,21 @@ def create_app(settings: Optional[Settings] = None, client: Optional[AsyncUpstre
                     headers=headers,
                 )
 
+        try:
+            return await _serve_admitted(payload, client_key, req_id, prompt_tokens, req_start_time)
+        except HTTPException as exc:
+            if exc.status_code >= 500:
+                # No provider served the request, so the client pays nothing for it.
+                await ctx.limiter.release_or_adjust(client_key, prompt_tokens, 0)
+            raise
+
+    async def _serve_admitted(
+        payload: ChatCompletionRequest,
+        client_key: str,
+        req_id: str,
+        prompt_tokens: int,
+        req_start_time: float,
+    ):
         # 2. Exact cache check
         cached_result = await ctx.cache.get(payload)
         if cached_result:
